@@ -29,6 +29,7 @@ import java.util.Objects;
 import java.util.stream.Stream;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
+import org.apache.lucene.codecs.hnsw.ExhaustiveVectorSearcher;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
@@ -47,6 +48,7 @@ import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
@@ -83,7 +85,7 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
   private final IndexInput quantizedVectorData;
   private final FlatVectorsReader rawVectorsReader;
   private final Lucene104ScalarQuantizedVectorScorer vectorScorer;
-  public static final int EXHAUSTIVE_BULK_SCORE_ORDS = 64;
+  public static final int EXHAUSTIVE_BULK_SCORE_ORDS = ExhaustiveVectorSearcher.BULK_SCORE_ORDS;
 
   public Lucene104ScalarQuantizedVectorsReader(
       SegmentReadState state,
@@ -343,37 +345,7 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
       RandomVectorScorer scorer, KnnCollector knnCollector, AcceptDocs acceptDocs)
       throws IOException {
     if (scorer == null) return;
-    Bits acceptedOrds = scorer.getAcceptOrds(acceptDocs.bits());
-    int[] ords = new int[EXHAUSTIVE_BULK_SCORE_ORDS];
-    float[] scores = new float[EXHAUSTIVE_BULK_SCORE_ORDS];
-    int numOrds = 0;
-    int numVectors = scorer.maxOrd();
-    for (int i = 0; i < numVectors; i++) {
-      if (acceptedOrds == null || acceptedOrds.get(i)) {
-        if (knnCollector.earlyTerminated()) {
-          break;
-        }
-        ords[numOrds++] = i;
-        if (numOrds == ords.length) {
-          knnCollector.incVisitedCount(numOrds);
-          if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
-            for (int j = 0; j < numOrds; j++) {
-              knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
-            }
-          }
-          numOrds = 0;
-        }
-      }
-    }
-
-    if (numOrds > 0) {
-      knnCollector.incVisitedCount(numOrds);
-      if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
-        for (int j = 0; j < numOrds; j++) {
-          knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
-        }
-      }
-    }
+    ExhaustiveVectorSearcher.search(scorer, knnCollector, acceptDocs);
   }
 
   @Override
@@ -715,6 +687,18 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
     }
 
     @Override
+    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
+        throws IOException {
+      return rawVectorValues.getAcceptOrds(acceptDocs, acceptDocsIterator);
+    }
+
+    @Override
+    public DocIdSetIterator acceptedOrdsIterator(
+        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
+      return rawVectorValues.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
+    }
+
+    @Override
     public int ordToDoc(int ord) {
       return rawVectorValues.ordToDoc(ord);
     }
@@ -774,6 +758,18 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
     @Override
     public Bits getAcceptOrds(Bits acceptDocs) {
       return rawVectorValues.getAcceptOrds(acceptDocs);
+    }
+
+    @Override
+    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
+        throws IOException {
+      return rawVectorValues.getAcceptOrds(acceptDocs, acceptDocsIterator);
+    }
+
+    @Override
+    public DocIdSetIterator acceptedOrdsIterator(
+        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
+      return rawVectorValues.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
     }
 
     @Override

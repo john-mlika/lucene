@@ -240,6 +240,14 @@ abstract class OffHeapScalarQuantizedFloatVectorValues extends FloatVectorValues
     }
 
     @Override
+    public DocIdSetIterator acceptedOrdsIterator(
+        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) {
+      // The ordinals are the docs, so the accepted docs are the accepted ordinals
+      assert size() == 0 || ordToDoc(size() - 1) == size() - 1;
+      return acceptDocs == null ? null : acceptDocsIterator;
+    }
+
+    @Override
     public VectorScorer scorer(float[] target) throws IOException {
       OffHeapScalarQuantizedFloatVectorValues.DenseOffHeapVectorValues copy = copy();
       DocIndexIterator iterator = copy.iterator();
@@ -331,6 +339,18 @@ abstract class OffHeapScalarQuantizedFloatVectorValues extends FloatVectorValues
           return size;
         }
       };
+    }
+
+    @Override
+    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
+        throws IOException {
+      if (acceptDocs == null) {
+        return null;
+      }
+      // Leap frog over a private view of the docs that have a vector, so that the iterator that
+      // this instance hands out is left where it is.
+      return materializeAcceptOrds(
+          acceptDocsIterator, IndexedDISI.asDocIndexIterator(configuration.getIndexedDISI(dataIn)));
     }
 
     @Override

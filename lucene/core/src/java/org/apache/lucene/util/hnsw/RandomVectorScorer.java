@@ -19,6 +19,7 @@ package org.apache.lucene.util.hnsw;
 
 import java.io.IOException;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.Bits;
 
 /**
@@ -78,6 +79,35 @@ public interface RandomVectorScorer {
     return acceptDocs;
   }
 
+  /**
+   * Returns the {@link Bits} representing the accepted ordinals, materialized up-front rather than
+   * computed on every test when the values that this scorer reads from can do it more cheaply. By
+   * default, this is {@link #getAcceptOrds(Bits)}.
+   *
+   * @param acceptDocs the accept docs
+   * @param acceptDocsIterator an iterator over the same docs as {@code acceptDocs}
+   * @return the accept ords
+   */
+  default Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
+      throws IOException {
+    return getAcceptOrds(acceptDocs);
+  }
+
+  /**
+   * Returns an iterator over the ordinals that {@link #getAcceptOrds(Bits)} accepts, in increasing
+   * order, or {@code null} when they cannot be enumerated and every ordinal has to be tested
+   * instead. By default they cannot be enumerated, since only the values this scorer reads from
+   * know how their ordinals map to their docs.
+   *
+   * @param acceptDocs the accept docs
+   * @param acceptDocsIterator an iterator over the same docs as {@code acceptDocs}
+   * @return the accepted ordinals in increasing order, or {@code null}
+   */
+  default DocIdSetIterator acceptedOrdsIterator(
+      Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
+    return null;
+  }
+
   /** Creates a default scorer for random access vectors. */
   abstract class AbstractRandomVectorScorer implements RandomVectorScorer, HasKnnVectorValues {
     private final KnnVectorValues values;
@@ -104,6 +134,18 @@ public interface RandomVectorScorer {
     @Override
     public Bits getAcceptOrds(Bits acceptDocs) {
       return values.getAcceptOrds(acceptDocs);
+    }
+
+    @Override
+    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
+        throws IOException {
+      return values.getAcceptOrds(acceptDocs, acceptDocsIterator);
+    }
+
+    @Override
+    public DocIdSetIterator acceptedOrdsIterator(
+        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
+      return values.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
     }
 
     @Override

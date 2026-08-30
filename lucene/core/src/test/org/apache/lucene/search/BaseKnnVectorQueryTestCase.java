@@ -773,6 +773,134 @@ abstract class BaseKnnVectorQueryTestCase extends LuceneTestCase {
     }
   }
 
+  /**
+   * A filtered search over a field where some docs have no vector must return the same hits as the
+   * same search over a field where every doc has one, including when the filter accepts docs that
+   * have no vector.
+   */
+  public void testFilteredSearchWithDocsWithoutVectors() throws IOException {
+    int numDocs = 4000;
+    int dimension = 16;
+    int k = 5;
+    float[][] vectors = new float[numDocs][];
+    for (int i = 0; i < numDocs; i++) {
+      // Every tenth doc has no vector, so that vector ordinals and doc ids differ
+      vectors[i] = i % 10 == 3 ? null : randomVector(dimension);
+    }
+    float[] queryVector = randomVector(dimension);
+    int maxAcceptedId = 1999;
+    Query filter = IntPoint.newRangeQuery("vid", 0, maxAcceptedId);
+
+    try (Directory sparseDir = newDirectoryForTest();
+        Directory denseDir = newDirectoryForTest()) {
+      // The same vectors in the same order in both indexes, so that they get the same graph. Only
+      // the sparse index also holds the docs that have no vector.
+      indexVectorsAndDeleteSome(sparseDir, vectors, true);
+      indexVectorsAndDeleteSome(denseDir, vectors, false);
+
+      try (DirectoryReader sparseReader = DirectoryReader.open(sparseDir);
+          DirectoryReader denseReader = DirectoryReader.open(denseDir)) {
+        assertEquals(1, sparseReader.leaves().size());
+        assertEquals(1, denseReader.leaves().size());
+        assertTrue(sparseReader.hasDeletions());
+        assertTrue(denseReader.hasDeletions());
+        LeafReaderContext ctx = sparseReader.leaves().get(0);
+        IndexSearcher sparseSearcher = new IndexSearcher(sparseReader);
+        IndexSearcher denseSearcher = new IndexSearcher(denseReader);
+        AbstractKnnVectorQuery query = getKnnVectorQuery("field", queryVector, k, filter);
+
+        // The docs that the filter accepts and that are live, with or without a vector
+        Weight filterWeight =
+            sparseSearcher.createWeight(
+                sparseSearcher.rewrite(filter), ScoreMode.COMPLETE_NO_SCORES, 1f);
+        FixedBitSet accepted = new FixedBitSet(ctx.reader().maxDoc());
+        accepted.or(filterWeight.scorer(ctx).iterator());
+        Bits liveDocs = ctx.reader().getLiveDocs();
+        for (int doc = 0; doc < accepted.length(); doc++) {
+          if (liveDocs.get(doc) == false) {
+            accepted.clear(doc);
+          }
+        }
+        // Among those, the ones that have a vector, which are the only possible matches
+        FixedBitSet matches = new FixedBitSet(ctx.reader().maxDoc());
+        VectorScorer vectorScorer =
+            query.createVectorScorer(ctx, ctx.reader().getFieldInfos().fieldInfo("field"));
+        DocIdSetIterator vectorDocs = vectorScorer.iterator();
+        for (int doc = vectorDocs.nextDoc(); doc != NO_MORE_DOCS; doc = vectorDocs.nextDoc()) {
+          if (accepted.get(doc)) {
+            matches.set(doc);
+          }
+        }
+        int expectedMatches = 0;
+        int numVectors = 0;
+        for (int i = 0; i < numDocs; i++) {
+          if (vectors[i] != null) {
+            numVectors++;
+            if (i <= maxAcceptedId && i % 13 != 0) {
+              expectedMatches++;
+            }
+          }
+        }
+        assertEquals(expectedMatches, matches.cardinality());
+        // The accept set is about half of the vectors: below the 60% at which the search stops
+        // filtering as it walks the graph, and an order of magnitude above the log(numVectors) * k
+        // vectors that an approximate search is expected to visit. The search therefore runs on
+        // the graph, and it stays there: the query only reruns as an exact search if the graph
+        // search visits as many vectors as the filter accepts.
+        assertTrue(accepted.cardinality() < 0.6 * numVectors);
+        assertTrue(accepted.cardinality() > 10 * Math.log(numVectors) * k);
+
+        TopDocs sparseDocs = sparseSearcher.search(query, k);
+        TopDocs denseDocs =
+            denseSearcher.search(getKnnVectorQuery("field", queryVector, k, filter), k);
+        assertEquals(k, sparseDocs.scoreDocs.length);
+        assertEquals(k, denseDocs.scoreDocs.length);
+        for (int i = 0; i < k; i++) {
+          // The hits hold the same vectors, under a different doc id in each index
+          assertEquals(denseDocs.scoreDocs[i].score, sparseDocs.scoreDocs[i].score, EPSILON);
+          assertTrue(matches.get(sparseDocs.scoreDocs[i].doc));
+        }
+
+        // The same search with a query that throws if it ever runs an exact search: the hits above
+        // came from the graph, not from a fallback that silently hides how the accepted ordinals
+        // are read
+        TopDocs approximate =
+            sparseSearcher.search(getThrowingKnnVectorQuery("field", queryVector, k, filter), k);
+        assertEquals(k, approximate.scoreDocs.length);
+        for (ScoreDoc hit : approximate.scoreDocs) {
+          assertTrue(matches.get(hit.doc));
+        }
+      }
+    }
+  }
+
+  private void indexVectorsAndDeleteSome(
+      Directory d, float[][] vectors, boolean indexDocsWithoutVectors) throws IOException {
+    IndexWriterConfig iwc = configStandardCodec();
+    // Buffer every doc, so that both indexes are written as a single segment from the same
+    // sequence of vectors and get the same graph
+    iwc.setMaxBufferedDocs(vectors.length + 1);
+    iwc.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
+    try (IndexWriter w = new IndexWriter(d, iwc)) {
+      for (int i = 0; i < vectors.length; i++) {
+        if (vectors[i] == null && indexDocsWithoutVectors == false) {
+          continue;
+        }
+        Document doc = new Document();
+        if (vectors[i] != null) {
+          doc.add(getKnnVectorField("field", vectors[i]));
+        }
+        doc.add(new IntPoint("vid", i));
+        doc.add(new StringField("delete", i % 13 == 0 ? "yes" : "no", Field.Store.NO));
+        w.addDocument(doc);
+      }
+      w.forceMerge(1);
+      // Delete after merging, so that the deleted docs stay in the segment and the search has to
+      // take live docs into account
+      w.deleteDocuments(new Term("delete", "yes"));
+    }
+  }
+
   /** Tests filtering when all vectors have the same score. */
   public void testFilterWithSameScore() throws IOException {
     int numDocs = 100;
