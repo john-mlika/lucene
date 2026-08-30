@@ -105,6 +105,47 @@ public class HnswGraphSearcher extends AbstractHnswGraphSearcher {
   }
 
   /**
+   * Whether {@link #search(RandomVectorScorer, KnnCollector, HnswGraph, Bits, int)} would search
+   * the graph with a searcher optimized for filtering. Such a searcher tests {@code acceptOrds} for
+   * the neighbors of every node that it visits, and not only for the nodes that it scores.
+   *
+   * <p>This is exposed for the same reason as {@link #expectedVisitedNodes(int, int)}: a caller
+   * that has a choice of how to present {@code acceptOrds} needs to know how heavily the search is
+   * going to test them before it makes that choice.
+   *
+   * @param knnCollector the collector that carries the search strategy
+   * @param acceptOrds {@link Bits} that represents the allowed document ordinals to match, or
+   *     {@code null} if they are all allowed to match.
+   * @param filteredDocCount the number of docs that pass the filter
+   * @param graphSize the number of nodes in the graph
+   * @param maxConn the maximum number of connections per node, or {@link
+   *     HnswGraph#UNKNOWN_MAX_CONN} if it is not known
+   */
+  public static boolean useFilteredSearch(
+      KnnCollector knnCollector,
+      Bits acceptOrds,
+      int filteredDocCount,
+      int graphSize,
+      int maxConn) {
+    return acceptOrds != null
+        // We can only use filtered search if we know the maxConn
+        && maxConn != HnswGraph.UNKNOWN_MAX_CONN
+        && filteredDocCount > 0
+        && hnswStrategy(knnCollector).useFilteredSearch((float) filteredDocCount / graphSize);
+  }
+
+  private static KnnSearchStrategy.Hnsw hnswStrategy(KnnCollector knnCollector) {
+    if (knnCollector.getSearchStrategy() instanceof KnnSearchStrategy.Hnsw hnsw) {
+      return hnsw;
+    }
+    if (knnCollector.getSearchStrategy() instanceof KnnSearchStrategy.Seeded seeded
+        && seeded.originalStrategy() instanceof KnnSearchStrategy.Hnsw hnsw) {
+      return hnsw;
+    }
+    return KnnSearchStrategy.Hnsw.DEFAULT;
+  }
+
+  /**
    * Searches the HNSW graph for the nearest neighbors of a query vector. If entry points are
    * directly provided via the knnCollector, then the search will be initialized at those points.
    * Otherwise, the search will discover the best entry point per the normal HNSW search algorithm.
@@ -125,22 +166,10 @@ public class HnswGraphSearcher extends AbstractHnswGraphSearcher {
       int filteredDocCount)
       throws IOException {
     assert filteredDocCount >= 0 && filteredDocCount <= graph.size();
-    KnnSearchStrategy.Hnsw hnswStrategy;
-    if (knnCollector.getSearchStrategy() instanceof KnnSearchStrategy.Hnsw hnsw) {
-      hnswStrategy = hnsw;
-    } else if (knnCollector.getSearchStrategy() instanceof KnnSearchStrategy.Seeded seeded
-        && seeded.originalStrategy() instanceof KnnSearchStrategy.Hnsw hnsw) {
-      hnswStrategy = hnsw;
-    } else {
-      hnswStrategy = KnnSearchStrategy.Hnsw.DEFAULT;
-    }
     final AbstractHnswGraphSearcher innerSearcher;
     // First, check if we should use a filtered searcher
-    if (acceptOrds != null
-        // We can only use filtered search if we know the maxConn
-        && graph.maxConn() != HnswGraph.UNKNOWN_MAX_CONN
-        && filteredDocCount > 0
-        && hnswStrategy.useFilteredSearch((float) filteredDocCount / graph.size())) {
+    if (useFilteredSearch(
+        knnCollector, acceptOrds, filteredDocCount, graph.size(), graph.maxConn())) {
       innerSearcher =
           FilteredHnswGraphSearcher.create(knnCollector.k(), graph, filteredDocCount, acceptOrds);
     } else {

@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
+import org.apache.lucene.codecs.hnsw.ExhaustiveVectorSearcher;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.HnswGraphProvider;
 import org.apache.lucene.index.ByteVectorValues;
@@ -42,6 +43,7 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataAccessHint;
@@ -78,7 +80,7 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
   private static final long SHALLOW_SIZE =
       RamUsageEstimator.shallowSizeOfInstance(Lucene99HnswVectorsFormat.class);
   // Number of ordinals to score at a time when scoring exhaustively rather than using HNSW.
-  public static final int EXHAUSTIVE_BULK_SCORE_ORDS = 64;
+  public static final int EXHAUSTIVE_BULK_SCORE_ORDS = ExhaustiveVectorSearcher.BULK_SCORE_ORDS;
 
   private final FlatVectorsReader flatVectorsReader;
   private final FieldInfos fieldInfos;
@@ -360,52 +362,87 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
     // Use approximate cardinality as this is good enough, but ensure we don't exceed the graph
     // size as that is illogical
     int graphSize = (fieldEntry.vectorIndexLength() == 0) ? 0 : fieldEntry.size();
+    int numVectors = scorer.maxOrd();
+    assert graphSize == 0 || graphSize == numVectors;
     int filteredDocCount = Math.min(acceptDocs.cost(), graphSize);
     Bits accepted = acceptDocs.bits();
-    final Bits acceptedOrds = scorer.getAcceptOrds(accepted);
-    int numVectors = scorer.maxOrd();
-    boolean doHnsw = knnCollector.k() < numVectors;
+    Bits acceptedOrds = scorer.getAcceptOrds(accepted);
     // The approximate number of vectors that would be visited if we did not filter
     int unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(knnCollector.k(), graphSize);
+    boolean doHnsw = knnCollector.k() < numVectors;
     if (unfilteredVisit >= filteredDocCount || graphSize == 0) {
       doHnsw = false;
+    }
+    if (doHnsw
+        && HnswGraphSearcher.useFilteredSearch(
+            knnCollector, acceptedOrds, filteredDocCount, graphSize, fieldEntry.M())
+        && shouldMaterializeAcceptOrds(filteredDocCount, graphSize, unfilteredVisit)) {
+      // The same bits, only answered in constant time. Accept docs that are backed by live docs
+      // alone hand out an iterator over every doc of the segment, but their cost is the whole
+      // segment too, so filteredDocCount is then graphSize and this branch is not taken.
+      acceptedOrds = scorer.getAcceptOrds(accepted, acceptDocs.iterator());
+      assert acceptedOrds != null;
     }
     if (doHnsw) {
       HnswGraphSearcher.search(
           scorer, collector, getGraph(fieldEntry), acceptedOrds, filteredDocCount);
     } else {
       // if k is larger than the number of vectors we expect to visit in an HNSW search,
-      // we can just iterate over all vectors and collect them.
-      int[] ords = new int[EXHAUSTIVE_BULK_SCORE_ORDS];
-      float[] scores = new float[EXHAUSTIVE_BULK_SCORE_ORDS];
-      int numOrds = 0;
-      for (int i = 0; i < numVectors; i++) {
-        if (acceptedOrds == null || acceptedOrds.get(i)) {
-          if (knnCollector.earlyTerminated()) {
-            break;
-          }
-          ords[numOrds++] = i;
-          if (numOrds == ords.length) {
-            knnCollector.incVisitedCount(numOrds);
-            if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
-              for (int j = 0; j < numOrds; j++) {
-                knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
-              }
-            }
-            numOrds = 0;
-          }
-        }
-      }
-
-      if (numOrds > 0) {
-        knnCollector.incVisitedCount(numOrds);
-        if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
-          for (int j = 0; j < numOrds; j++) {
-            knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
-          }
-        }
-      }
+      // we can just score all the accepted vectors and collect them.
+      DocIdSetIterator acceptedOrdsIterator =
+          accepted == null ? null : scorer.acceptedOrdsIterator(accepted, acceptDocs.iterator());
+      ExhaustiveVectorSearcher.search(scorer, knnCollector, acceptedOrds, acceptedOrdsIterator);
     }
+  }
+
+  /**
+   * How many docs of the accept set one step of the leap frog that materializes the accepted
+   * ordinals costs, counted in the ordinal to doc lookups that materializing saves. Both iterators
+   * only move forward, so a step is a few times cheaper than a lookup, which is a random read into
+   * the off-heap ordinal to doc mapping.
+   *
+   * <p>This is an empirical value, fitted on a 200k doc index where 10% of the docs have no vector,
+   * with maxConn=16 and k=100: materializing wins when the filter accepts 20k docs and loses when
+   * it accepts 40k, and this value puts the crossover at 30k.
+   */
+  static final int ACCEPTED_DOCS_PER_LOOKUP = 4;
+
+  /**
+   * How many bits of the materialized bit set one ordinal to doc lookup pays for. Zeroing memory
+   * runs at a few bytes per nanosecond while a lookup costs tens of nanoseconds, so a lookup is
+   * worth a couple of hundred bytes. This is a hardware ratio rather than a fitted value, and it
+   * only decides anything on graphs large enough that allocating the bit set outweighs the lookups
+   * that it saves.
+   */
+  static final int ZEROED_BITS_PER_LOOKUP = 2048;
+
+  /**
+   * Whether to materialize the accepted ordinals into a bit set before searching the graph with a
+   * searcher optimized for filtering, rather than mapping every tested ordinal to its doc through
+   * the off-heap ordinal to doc mapping.
+   *
+   * <p>Such a searcher tests the accepted ordinals of every neighbor of the nodes that it pops, and
+   * only counts as visited the neighbors that pass and get scored, so it runs about {@code
+   * unfilteredVisit * graphSize / filteredDocCount} tests, which is the estimate that {@code
+   * FilteredHnswGraphSearcher} itself uses to size its visited bit set. It tests a node at most
+   * once, so the graph size caps that count. The count does not depend on the number of connections
+   * per node to first order: a larger fan-out makes every pop more expensive, it does not change
+   * how many nodes have to be tested before enough of them pass.
+   *
+   * <p>Materializing costs one step of a leap frog per accepted doc, plus a bit set of {@code
+   * graphSize} bits to allocate and zero, and saves one lookup per test. Both sides are counted in
+   * lookups.
+   *
+   * @param filteredDocCount the number of docs that pass the filter
+   * @param graphSize the number of nodes in the graph
+   * @param unfilteredVisit the number of nodes that an unfiltered search is expected to visit
+   */
+  static boolean shouldMaterializeAcceptOrds(
+      int filteredDocCount, int graphSize, int unfilteredVisit) {
+    assert filteredDocCount > 0 && filteredDocCount <= graphSize;
+    long tests = Math.min((long) unfilteredVisit * graphSize / filteredDocCount, graphSize);
+    long cost = filteredDocCount / ACCEPTED_DOCS_PER_LOOKUP + graphSize / ZEROED_BITS_PER_LOOKUP;
+    return cost <= tests;
   }
 
   @Override
