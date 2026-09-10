@@ -18,12 +18,14 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.List;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.IOSupplier;
 
 public class TestAcceptDocs extends LuceneTestCase {
 
@@ -268,5 +270,131 @@ public class TestAcceptDocs extends LuceneTestCase {
       }
       assertEquals(DocIdSetIterator.NO_MORE_DOCS, iterator.nextDoc());
     }
+  }
+
+  /**
+   * The masked factory must produce exactly the same accept docs -- bits, cost and iterator -- as
+   * passing the conjunction of the two iterators to the single-iterator factory, on both sides of
+   * the dense/sparse boundary and whatever the number of deleted docs.
+   */
+  public void testMaskIsEquivalentToConjunction() throws IOException {
+    int iters = atLeast(200);
+    for (int iter = 0; iter < iters; ++iter) {
+      int maxDoc = TestUtil.nextInt(random(), 1, 5000);
+      int threshold = maxDoc >> 7; // AcceptDocs' dense/sparse boundary
+
+      FixedBitSet filter = randomBitSet(maxDoc, threshold);
+      FixedBitSet mask = randomBitSet(maxDoc, threshold);
+
+      FixedBitSet liveDocs = new FixedBitSet(maxDoc);
+      liveDocs.set(0, maxDoc);
+      Bits liveDocsBits;
+      if (random().nextInt(5) == 0) {
+        liveDocsBits = null; // no deletions
+      } else {
+        int deleteCount =
+            switch (random().nextInt(3)) {
+              case 0 -> 0;
+              case 1 -> 1;
+              default -> TestUtil.nextInt(random(), 1, maxDoc);
+            };
+        for (int i = 0; i < deleteCount; ++i) {
+          liveDocs.clear(random().nextInt(maxDoc));
+        }
+        liveDocsBits = liveDocs.asReadOnlyBits();
+      }
+
+      // Half of the time, hide the fact that a source is a BitSetIterator behind a
+      // FilterDocIdSetIterator, so that both the bulk and the generic paths get coverage.
+      boolean opaqueFilter = random().nextBoolean();
+      boolean opaqueMask = random().nextBoolean();
+      IOSupplier<DocIdSetIterator> filterSupplier =
+          () -> maybeOpaque(new BitSetIterator(filter, filter.cardinality()), opaqueFilter);
+      IOSupplier<DocIdSetIterator> maskSupplier =
+          () -> maybeOpaque(new BitSetIterator(mask, mask.cardinality()), opaqueMask);
+
+      AcceptDocs masked =
+          AcceptDocs.fromIteratorSupplier(filterSupplier, maskSupplier, liveDocsBits, maxDoc);
+      AcceptDocs conjunction =
+          AcceptDocs.fromIteratorSupplier(
+              () ->
+                  ConjunctionUtils.intersectIterators(
+                      List.of(filterSupplier.get(), maskSupplier.get())),
+              liveDocsBits,
+              maxDoc);
+
+      FixedBitSet expected = filter.clone();
+      expected.and(mask);
+      expected.and(liveDocs);
+
+      String message = "maxDoc=" + maxDoc + " iter=" + iter;
+      Bits maskedBits = masked.bits();
+      Bits conjunctionBits = conjunction.bits();
+      assertEquals(message, maxDoc, maskedBits.length());
+      for (int doc = 0; doc < maxDoc; ++doc) {
+        assertEquals(message + " doc=" + doc, expected.get(doc), maskedBits.get(doc));
+        assertEquals(message + " doc=" + doc, conjunctionBits.get(doc), maskedBits.get(doc));
+      }
+      assertEquals(message, expected.cardinality(), masked.cost());
+      assertEquals(message, conjunction.cost(), masked.cost());
+
+      DocIdSetIterator iterator = masked.iterator();
+      for (int doc = expected.nextSetBit(0);
+          doc != DocIdSetIterator.NO_MORE_DOCS;
+          doc = doc + 1 >= maxDoc ? DocIdSetIterator.NO_MORE_DOCS : expected.nextSetBit(doc + 1)) {
+        assertEquals(message, doc, iterator.nextDoc());
+      }
+      assertEquals(message, DocIdSetIterator.NO_MORE_DOCS, iterator.nextDoc());
+
+      // Same, without ever asking for bits() or cost() first: iterator() must be able to apply
+      // the mask on its own.
+      AcceptDocs iteratorOnly =
+          AcceptDocs.fromIteratorSupplier(filterSupplier, maskSupplier, liveDocsBits, maxDoc);
+      iterator = iteratorOnly.iterator();
+      for (int doc = expected.nextSetBit(0);
+          doc != DocIdSetIterator.NO_MORE_DOCS;
+          doc = doc + 1 >= maxDoc ? DocIdSetIterator.NO_MORE_DOCS : expected.nextSetBit(doc + 1)) {
+        assertEquals(message, doc, iterator.nextDoc());
+      }
+      assertEquals(message, DocIdSetIterator.NO_MORE_DOCS, iterator.nextDoc());
+    }
+  }
+
+  /** A null mask must behave exactly like the single-iterator factory. */
+  public void testNullMask() throws IOException {
+    int maxDoc = TestUtil.nextInt(random(), 1, 1000);
+    FixedBitSet filter = randomBitSet(maxDoc, maxDoc >> 7);
+    AcceptDocs acceptDocs =
+        AcceptDocs.fromIteratorSupplier(
+            () -> new BitSetIterator(filter, filter.cardinality()), null, null, maxDoc);
+    assertEquals(filter.cardinality(), acceptDocs.cost());
+    for (int doc = 0; doc < maxDoc; ++doc) {
+      assertEquals(filter.get(doc), acceptDocs.bits().get(doc));
+    }
+  }
+
+  private static DocIdSetIterator maybeOpaque(DocIdSetIterator iterator, boolean opaque) {
+    return opaque ? new FilterDocIdSetIterator(iterator) : iterator;
+  }
+
+  /** A bit set whose cardinality lands on either side of {@code threshold} often enough. */
+  private static FixedBitSet randomBitSet(int maxDoc, int threshold) {
+    int targetCardinality =
+        switch (random().nextInt(6)) {
+          case 0 -> 0;
+          case 1 -> Math.max(0, threshold - 1);
+          case 2 -> threshold;
+          case 3 -> threshold + 1;
+          case 4 -> maxDoc;
+          default -> TestUtil.nextInt(random(), 0, maxDoc);
+        };
+    targetCardinality = Math.min(targetCardinality, maxDoc);
+    FixedBitSet bitSet = new FixedBitSet(maxDoc);
+    for (int cardinality = 0; cardinality < targetCardinality; ) {
+      if (bitSet.getAndSet(random().nextInt(maxDoc)) == false) {
+        cardinality++;
+      }
+    }
+    return bitSet;
   }
 }

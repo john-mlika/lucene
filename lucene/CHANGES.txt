@@ -431,6 +431,11 @@ Optimizations
   delegates DocIdSetIterator#intoBitSet and #docIDRunEnd, so loading the doc IDs of a sparse vector
   field into a bit set is a bulk operation again. (John Maurice)
 
+* GITHUB#XXXXX: AbstractKnnVectorQuery intersects the pre-filter with the docs that have a vector
+  with bulk word-level operations rather than by walking a conjunction one doc at a time, and
+  creates the filter weight through IndexSearcher#createWeight so that the query cache applies to
+  the filter itself. The accept docs, and their cost, are unchanged. (John Maurice)
+
 * GITHUB#16593: DenseLiveDocs and SparseLiveDocs implement Bits#applyMask in bulk, restoring the
   word-at-a-time masking that live docs had before GITHUB#13084 exposed them as LiveDocs rather than
   as a FixedBitSet, so AcceptDocs, the bulk scorers and CheckIndex no longer test one bit per

@@ -42,12 +42,16 @@ import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.KnnByteVectorQuery;
+import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
+import org.apache.lucene.search.PatienceKnnVectorQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.SeededKnnVectorQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.Weight;
@@ -78,6 +82,20 @@ abstract class ParentBlockJoinKnnVectorQueryTestCase extends LuceneTestCase {
   }
 
   abstract float[] randomVector(int dim);
+
+  static Query seededQuery(Query query, Query seed) {
+    if (query instanceof KnnFloatVectorQuery floatQuery) {
+      return SeededKnnVectorQuery.fromFloatQuery(floatQuery, seed);
+    }
+    return SeededKnnVectorQuery.fromByteQuery((KnnByteVectorQuery) query, seed);
+  }
+
+  static Query patienceQuery(Query query) {
+    if (query instanceof KnnFloatVectorQuery floatQuery) {
+      return PatienceKnnVectorQuery.fromFloatQuery(floatQuery);
+    }
+    return PatienceKnnVectorQuery.fromByteQuery((KnnByteVectorQuery) query);
+  }
 
   abstract Query getParentJoinKnnQuery(
       String fieldName, float[] queryVector, Query childFilter, int k, BitSetProducer parentBitSet);
@@ -184,6 +202,63 @@ abstract class ParentBlockJoinKnnVectorQueryTestCase extends LuceneTestCase {
       Query kvq = getParentJoinKnnQuery("field", new float[] {1, 2}, filter, 2, parentFilter);
       TopDocs topDocs = searcher.search(kvq, 3);
       assertEquals(0, topDocs.totalHits.value());
+    }
+  }
+
+  /**
+   * A child that matches the child filter but has no vector must not be scored: the diversifying
+   * scorer advances the vector iterator to the next accepted child without checking where it
+   * landed, so such a child would otherwise be given the score of a vector that belongs to another
+   * parent.
+   */
+  public void testFilterMatchingChildWithoutVector() throws IOException {
+    try (Directory d = newDirectory()) {
+      try (IndexWriter w =
+          new IndexWriter(
+              d,
+              newIndexWriterConfig()
+                  .setCodec(TestUtil.getDefaultCodec())
+                  .setMergePolicy(newMergePolicy(random(), false)))) {
+        // A child that matches the filter, with a vector far away from the query vector
+        Document child = new Document();
+        child.add(getKnnVectorField("field", new float[] {10, 0}));
+        child.add(newStringField("tag", "accept", Field.Store.NO));
+        child.add(newStringField("id", "1", Field.Store.YES));
+        w.addDocuments(List.of(child, makeParent(new int[] {1})));
+
+        // A child of another parent that matches the filter but has no vector
+        child = new Document();
+        child.add(newStringField("tag", "accept", Field.Store.NO));
+        child.add(newStringField("id", "2", Field.Store.YES));
+        w.addDocuments(List.of(child, makeParent(new int[] {2})));
+
+        // A child of a third parent, excluded by the filter, whose vector is the closest one to
+        // the query vector
+        child = new Document();
+        child.add(getKnnVectorField("field", new float[] {1, 0}));
+        child.add(newStringField("tag", "other", Field.Store.NO));
+        child.add(newStringField("id", "3", Field.Store.YES));
+        w.addDocuments(List.of(child, makeParent(new int[] {3})));
+        w.forceMerge(1);
+      }
+      try (IndexReader reader = DirectoryReader.open(d)) {
+        assertEquals(1, reader.leaves().size());
+        IndexSearcher searcher = newSearcher(reader);
+        Query filter = new TermQuery(new Term("tag", "accept"));
+        Query query =
+            getParentJoinKnnQuery("field", new float[] {1, 0}, filter, 2, parentFilter(reader));
+        float expectedScore =
+            VectorSimilarityFunction.EUCLIDEAN.compare(new float[] {1, 0}, new float[] {10, 0});
+        // The seeded and patience wrappers delegate the search to the diversifying query and
+        // must keep its filter handling
+        for (Query q :
+            List.of(query, seededQuery(query, new MatchNoDocsQuery()), patienceQuery(query))) {
+          TopDocs topDocs = searcher.search(q, 2);
+          assertEquals(q.toString(), 1, topDocs.scoreDocs.length);
+          assertIdMatches(reader, "1", topDocs.scoreDocs[0].doc);
+          assertEquals(expectedScore, topDocs.scoreDocs[0].score, 0.0001);
+        }
+      }
     }
   }
 

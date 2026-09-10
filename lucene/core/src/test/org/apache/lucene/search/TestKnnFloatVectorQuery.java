@@ -34,6 +34,7 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.QueryTimeout;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -42,6 +43,8 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.TestVectorUtil;
 import org.apache.lucene.util.VectorUtil;
 
@@ -271,6 +274,77 @@ public class TestKnnFloatVectorQuery extends BaseKnnVectorQueryTestCase {
             assertEquals(iteratorCount, count);
           }
         }
+      }
+    }
+  }
+
+  /**
+   * The accept docs handed to the vector reader are exactly {@code filter AND hasVector AND
+   * liveDocs}, and {@link AcceptDocs#cost()} is that set's cardinality -- the vector reader uses
+   * that cost to pick between graph and exhaustive search, so an approximation of it would change
+   * which search it runs.
+   */
+  public void testAcceptDocsAreFilterAndVectorPresenceAndLiveDocs() throws IOException {
+    int numDocs = 1000;
+    int dimension = 4;
+    try (Directory d = newDirectoryForTest()) {
+      try (IndexWriter w =
+          new IndexWriter(d, configStandardCodec().setMergePolicy(NoMergePolicy.INSTANCE))) {
+        for (int i = 0; i < numDocs; ++i) {
+          Document doc = new Document();
+          doc.add(new StringField("id", Integer.toString(i), Field.Store.NO));
+          doc.add(new StringField("tag", i % 3 == 0 ? "accept" : "other", Field.Store.NO));
+          if (i % 5 != 0) {
+            doc.add(new KnnFloatVectorField("field", randomVector(dimension), DOT_PRODUCT));
+          }
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+        for (int i = 0; i < numDocs; i += 17) {
+          w.deleteDocuments(new Term("id", Integer.toString(i)));
+        }
+        w.commit();
+      }
+      try (IndexReader reader = DirectoryReader.open(d)) {
+        assertEquals(1, reader.leaves().size());
+        IndexSearcher searcher = newSearcher(reader);
+        LeafReaderContext ctx = reader.leaves().get(0);
+
+        FixedBitSet expected = new FixedBitSet(ctx.reader().maxDoc());
+        Query filter = new TermQuery(new Term("tag", "accept"));
+        Weight filterWeight =
+            searcher.createWeight(searcher.rewrite(filter), ScoreMode.COMPLETE_NO_SCORES, 1f);
+        expected.or(filterWeight.scorer(ctx).iterator());
+        FixedBitSet hasVector = new FixedBitSet(ctx.reader().maxDoc());
+        hasVector.or(ctx.reader().getFloatVectorValues("field").iterator());
+        expected.and(hasVector);
+        Bits liveDocs = ctx.reader().getLiveDocs();
+        assertNotNull(liveDocs);
+        liveDocs.applyMask(expected, 0);
+        assertTrue(expected.cardinality() > 0);
+
+        int[] calls = new int[1];
+        AbstractKnnVectorQuery query =
+            new KnnFloatVectorQuery("field", randomVector(dimension), 10, filter) {
+              @Override
+              protected TopDocs approximateSearch(
+                  LeafReaderContext context,
+                  AcceptDocs acceptDocs,
+                  int visitedLimit,
+                  KnnCollectorManager knnCollectorManager)
+                  throws IOException {
+                calls[0]++;
+                assertEquals(expected.cardinality(), acceptDocs.cost());
+                Bits bits = acceptDocs.bits();
+                for (int doc = 0; doc < expected.length(); ++doc) {
+                  assertEquals("doc=" + doc, expected.get(doc), bits.get(doc));
+                }
+                return super.approximateSearch(
+                    context, acceptDocs, visitedLimit, knnCollectorManager);
+              }
+            };
+        searcher.search(query, 10);
+        assertEquals(1, calls[0]);
       }
     }
   }

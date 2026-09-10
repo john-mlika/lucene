@@ -18,6 +18,7 @@
 package org.apache.lucene.search;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Objects;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.util.BitSet;
@@ -87,11 +88,37 @@ public abstract class AcceptDocs {
    */
   public static AcceptDocs fromIteratorSupplier(
       IOSupplier<DocIdSetIterator> iteratorSupplier, Bits liveDocs, int maxDoc) {
-    return new DocIdSetIteratorAcceptDocs(iteratorSupplier, liveDocs, maxDoc);
+    return fromIteratorSupplier(iteratorSupplier, null, liveDocs, maxDoc);
   }
 
-  private static BitSet createBitSet(DocIdSetIterator iterator, Bits liveDocs, int maxDoc)
+  /**
+   * Same as {@link #fromIteratorSupplier(IOSupplier, Bits, int)}, but the accepted documents are
+   * additionally intersected with {@code maskSupplier}. This is equivalent to passing the
+   * conjunction of the two iterators to {@link #fromIteratorSupplier(IOSupplier, Bits, int)} -
+   * {@link #bits()}, {@link #iterator()} and {@link #cost()} all see the same set of documents -
+   * except that the intersection can be computed with bulk word-level operations rather than by
+   * walking a conjunction one document at a time.
+   *
+   * @param iteratorSupplier a DocIdSetIterator iterator
+   * @param maskSupplier a second DocIdSetIterator to intersect with, or {@code null}
+   * @param liveDocs Bits representing live documents, or {@code null} if no deleted docs.
+   * @param maxDoc the number of documents in the reader
+   * @return AcceptDocs wrapping the intersection of the two iterators
+   */
+  public static AcceptDocs fromIteratorSupplier(
+      IOSupplier<DocIdSetIterator> iteratorSupplier,
+      IOSupplier<DocIdSetIterator> maskSupplier,
+      Bits liveDocs,
+      int maxDoc) {
+    return new DocIdSetIteratorAcceptDocs(iteratorSupplier, maskSupplier, liveDocs, maxDoc);
+  }
+
+  private static BitSet createBitSet(
+      DocIdSetIterator iterator, DocIdSetIterator mask, Bits liveDocs, int maxDoc)
       throws IOException {
+    if (mask != null) {
+      return createMaskedBitSet(iterator, mask, liveDocs, maxDoc);
+    }
     if (liveDocs == null && iterator instanceof BitSetIterator bitSetIterator) {
       // If we already have a BitSet and no deletions, reuse the BitSet
       return bitSetIterator.getBitSet();
@@ -111,6 +138,59 @@ public abstract class AcceptDocs {
             maxDoc); // create a sparse bitset
       }
     }
+  }
+
+  private static BitSet createMaskedBitSet(
+      DocIdSetIterator iterator, DocIdSetIterator mask, Bits liveDocs, int maxDoc)
+      throws IOException {
+    // A conjunction's cost is the minimum cost of its clauses, so this picks the same
+    // dense-vs-sparse representation that the equivalent conjunction would have picked.
+    long cost = Math.min(iterator.cost(), mask.cost());
+    int threshold = maxDoc >> 7; // same as BitSet#of
+    if (cost < threshold) {
+      // Too sparse for a FixedBitSet: fall back to walking the conjunction, which also avoids
+      // decoding a mask that may be much denser than the intersection.
+      return BitSet.of(
+          AcceptDocs.getFilteredDocIdSetIterator(
+              ConjunctionUtils.intersectIterators(List.of(iterator, mask)), liveDocs),
+          maxDoc);
+    }
+
+    FixedBitSet bitSet = new FixedBitSet(maxDoc);
+    // Materialize whichever side is not already backed by a FixedBitSet, and apply the other one
+    // as a mask: Bits#applyMask is a bulk word-level AND on FixedBitSet.
+    Bits iteratorBits = asBulkMask(iterator, maxDoc);
+    if (iteratorBits != null) {
+      bitSet.or(mask);
+      iteratorBits.applyMask(bitSet, 0);
+    } else {
+      bitSet.or(iterator);
+      Bits maskBits = asBulkMask(mask, maxDoc);
+      if (maskBits == null) {
+        FixedBitSet maskBitSet = new FixedBitSet(maxDoc);
+        maskBitSet.or(mask);
+        maskBits = maskBitSet;
+      }
+      maskBits.applyMask(bitSet, 0);
+    }
+    if (liveDocs != null) {
+      liveDocs.applyMask(bitSet, 0);
+    }
+    return bitSet;
+  }
+
+  /**
+   * Return a {@link Bits} view of {@code iterator} that implements {@link Bits#applyMask} in bulk,
+   * without consuming or copying the iterator, or {@code null} if there is no such view.
+   */
+  private static Bits asBulkMask(DocIdSetIterator iterator, int maxDoc) {
+    if (iterator instanceof BitSetIterator bitSetIterator
+        && bitSetIterator.getBitSet() instanceof FixedBitSet fixedBitSet
+        // A shorter bit set would make FixedBitSet#applyMask throw on bits set beyond its end.
+        && fixedBitSet.length() >= maxDoc) {
+      return fixedBitSet;
+    }
+    return null;
   }
 
   /**
@@ -162,14 +242,19 @@ public abstract class AcceptDocs {
   private static class DocIdSetIteratorAcceptDocs extends AcceptDocs {
 
     private final IOSupplier<DocIdSetIterator> iteratorSupplier;
+    private final IOSupplier<DocIdSetIterator> maskSupplier;
     private final Bits liveDocs;
     private final int maxDoc;
     private BitSet acceptBitSet;
     private int cardinality;
 
     DocIdSetIteratorAcceptDocs(
-        IOSupplier<DocIdSetIterator> iteratorSupplier, Bits liveDocs, int maxDoc) {
+        IOSupplier<DocIdSetIterator> iteratorSupplier,
+        IOSupplier<DocIdSetIterator> maskSupplier,
+        Bits liveDocs,
+        int maxDoc) {
       this.iteratorSupplier = Objects.requireNonNull(iteratorSupplier);
+      this.maskSupplier = maskSupplier;
       this.liveDocs = liveDocs;
       this.maxDoc = maxDoc;
     }
@@ -179,7 +264,9 @@ public abstract class AcceptDocs {
         // Pass the raw iterator: #createBitSet applies liveDocs itself, and filtering upfront
         // would hide DocIdSetIterator#intoBitSet behind a wrapper that has no bulk implementation.
         DocIdSetIterator iterator = Objects.requireNonNull(iteratorSupplier.get());
-        acceptBitSet = Objects.requireNonNull(createBitSet(iterator, liveDocs, maxDoc));
+        DocIdSetIterator mask =
+            maskSupplier == null ? null : Objects.requireNonNull(maskSupplier.get());
+        acceptBitSet = Objects.requireNonNull(createBitSet(iterator, mask, liveDocs, maxDoc));
         cardinality = acceptBitSet.cardinality();
       }
     }
@@ -202,6 +289,11 @@ public abstract class AcceptDocs {
         return new BitSetIterator(acceptBitSet, cardinality);
       }
       DocIdSetIterator iterator = Objects.requireNonNull(iteratorSupplier.get());
+      if (maskSupplier != null) {
+        iterator =
+            ConjunctionUtils.intersectIterators(
+                List.of(iterator, Objects.requireNonNull(maskSupplier.get())));
+      }
       return AcceptDocs.getFilteredDocIdSetIterator(iterator, liveDocs);
     }
   }
