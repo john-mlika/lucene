@@ -452,6 +452,16 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       public long cost() {
         return disi.cost();
       }
+
+      @Override
+      public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+        disi.intoBitSet(upTo, bitSet, offset);
+      }
+
+      @Override
+      public int docIDRunEnd() throws IOException {
+        return disi.docIDRunEnd();
+      }
     };
   }
 
