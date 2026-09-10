@@ -427,6 +427,10 @@ Improvements
 
 Optimizations
 ---------------------
+* GITHUB#XXXXX: The KnnVectorValues.DocIndexIterator that IndexedDISI#asDocIndexIterator returns
+  delegates DocIdSetIterator#intoBitSet and #docIDRunEnd, so loading the doc IDs of a sparse vector
+  field into a bit set is a bulk operation again. (John Maurice)
+
 * GITHUB#16593: DenseLiveDocs and SparseLiveDocs implement Bits#applyMask in bulk, restoring the
   word-at-a-time masking that live docs had before GITHUB#13084 exposed them as LiveDocs rather than
   as a FixedBitSet, so AcceptDocs, the bulk scorers and CheckIndex no longer test one bit per
