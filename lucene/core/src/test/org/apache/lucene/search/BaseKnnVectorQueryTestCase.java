@@ -70,6 +70,17 @@ abstract class BaseKnnVectorQueryTestCase extends LuceneTestCase {
   // handle quantization noise
   static final float EPSILON = 0.001f;
 
+  private static final QueryCachingPolicy ALWAYS_CACHE =
+      new QueryCachingPolicy() {
+        @Override
+        public void onUse(Query query) {}
+
+        @Override
+        public boolean shouldCache(Query query) {
+          return true;
+        }
+      };
+
   abstract AbstractKnnVectorQuery getKnnVectorQuery(
       String field, float[] query, int k, Query queryFilter);
 
@@ -266,6 +277,126 @@ abstract class BaseKnnVectorQueryTestCase extends LuceneTestCase {
           getThrowingKnnVectorQuery("field", new float[] {0, 0}, 10, MatchAllDocsQuery.INSTANCE);
       TopDocs topDocs = searcher.search(kvq, 3);
       assertEquals(3, topDocs.totalHits.value());
+    }
+  }
+
+  public void testFilterMatchingDocsWithoutVectors() throws IOException {
+    try (Directory indexStore = getPartiallyVectoredIndexStore("field");
+        IndexReader reader = DirectoryReader.open(indexStore)) {
+      IndexSearcher searcher = newSearcher(reader);
+      Query filter = new TermQuery(new Term("tag", "accept"));
+      Query kvq = getKnnVectorQuery("field", new float[] {0, 0}, 10, filter);
+      TopDocs topDocs = searcher.search(kvq, 10);
+      // The filter matches docs id0 to id5, but id1 and id3 have no vector
+      assertEquals(4, topDocs.scoreDocs.length);
+      assertTopIdsMatches(reader, Set.of("id0", "id2", "id4", "id5"), topDocs.scoreDocs);
+    }
+  }
+
+  /**
+   * The pre-filter must be cacheable on its own, not only as a clause of a conjunction that the
+   * query builds around it.
+   */
+  public void testFilterGoesThroughTheQueryCache() throws IOException {
+    try (Directory indexStore = getPartiallyVectoredIndexStore("field");
+        IndexReader reader = DirectoryReader.open(indexStore);
+        LRUQueryCache queryCache = new LRUQueryCache(1000, 1 << 20, _ -> true, 1f)) {
+      IndexSearcher searcher = new IndexSearcher(reader);
+      searcher.setQueryCache(queryCache);
+      searcher.setQueryCachingPolicy(ALWAYS_CACHE);
+
+      Query filter = new TermQuery(new Term("tag", "accept"));
+      searcher.search(getKnnVectorQuery("field", new float[] {0, 0}, 3, filter), 3);
+      long hitCount = queryCache.getHitCount();
+      searcher.search(getKnnVectorQuery("field", new float[] {1, 1}, 3, filter), 3);
+      assertTrue(queryCache.getHitCount() > hitCount);
+    }
+  }
+
+  public void testFilterOnMissingVectorField() throws IOException {
+    try (Directory indexStore = getPartiallyVectoredIndexStore("field");
+        IndexReader reader = DirectoryReader.open(indexStore)) {
+      IndexSearcher searcher = newSearcher(reader);
+      Query filter = new TermQuery(new Term("tag", "accept"));
+      assertMatches(searcher, getKnnVectorQuery("xyzzy", new float[] {0, 0}, 5, filter), 0);
+    }
+  }
+
+  /**
+   * The accept docs of a filtered kNN query are the filter, intersected with the docs that have a
+   * vector and with live docs. Building that intersection with a mask must return exactly what
+   * conjoining a {@link FieldExistsQuery} into the filter itself returns, whatever the filter
+   * density, the vector density and the number of deleted docs.
+   */
+  public void testRandomFilterMatchesExplicitFieldExistsConjunction() throws IOException {
+    int numDocs = atLeast(500);
+    int dimension = 4;
+    try (Directory d = newDirectoryForTest()) {
+      try (IndexWriter w = new IndexWriter(d, configStandardCodec())) {
+        // A vector density that is dense in some segments and sparse in others, so that
+        // FieldExistsQuery both stays a real query and, sometimes, rewrites to MatchAllDocsQuery.
+        for (int i = 0; i < numDocs; ++i) {
+          Document doc = new Document();
+          doc.add(new StringField("id", Integer.toString(i), Field.Store.YES));
+          doc.add(new StringField("tag", "t" + (i % 16), Field.Store.NO));
+          if (i % 7 != 0) {
+            doc.add(getKnnVectorField("field", randomVector(dimension)));
+          }
+          w.addDocument(doc);
+          if (i % 137 == 0) {
+            w.flush();
+          }
+        }
+        // Deletions, so that liveDocs is non-null
+        for (int i = 0; i < numDocs; i += 23) {
+          w.deleteDocuments(new Term("id", Integer.toString(i)));
+        }
+        w.commit();
+      }
+      try (IndexReader reader = DirectoryReader.open(d)) {
+        IndexSearcher searcher = newSearcher(reader);
+        for (int iter = 0; iter < 30; ++iter) {
+          Query filter;
+          switch (random().nextInt(4)) {
+            case 0 -> filter = new TermQuery(new Term("tag", "t" + random().nextInt(16)));
+            case 1 -> {
+              BooleanQuery.Builder builder = new BooleanQuery.Builder();
+              for (int i = 0; i < 8; ++i) {
+                builder.add(
+                    new TermQuery(new Term("tag", "t" + random().nextInt(16))),
+                    BooleanClause.Occur.SHOULD);
+              }
+              filter = builder.build();
+            }
+            case 2 ->
+                filter = new TermQuery(new Term("id", Integer.toString(random().nextInt(numDocs))));
+            default -> filter = new TermQuery(new Term("tag", "nomatch"));
+          }
+          Query withConjunct =
+              new BooleanQuery.Builder()
+                  .add(filter, BooleanClause.Occur.FILTER)
+                  .add(new FieldExistsQuery("field"), BooleanClause.Occur.FILTER)
+                  .build();
+
+          int k = TestUtil.nextInt(random(), 1, 20);
+          float[] target = randomVector(dimension);
+          TopDocs expected =
+              searcher.search(getKnnVectorQuery("field", target, k, withConjunct), k);
+          TopDocs actual = searcher.search(getKnnVectorQuery("field", target, k, filter), k);
+
+          String message = "iter=" + iter + " filter=" + filter + " k=" + k;
+          assertEquals(message, expected.totalHits.value(), actual.totalHits.value());
+          assertEquals(message, expected.scoreDocs.length, actual.scoreDocs.length);
+          for (int i = 0; i < expected.scoreDocs.length; ++i) {
+            assertEquals(message + " i=" + i, expected.scoreDocs[i].doc, actual.scoreDocs[i].doc);
+            assertEquals(
+                message + " i=" + i,
+                expected.scoreDocs[i].score,
+                actual.scoreDocs[i].score,
+                EPSILON);
+          }
+        }
+      }
     }
   }
 
@@ -1093,6 +1224,29 @@ abstract class BaseKnnVectorQueryTestCase extends LuceneTestCase {
       writer.addDocument(doc);
     }
     writer.close();
+    return indexStore;
+  }
+
+  /**
+   * Creates a new single-segment directory with 10 documents whose ids are {@code id0} to {@code
+   * id9}. The first six documents have {@code tag:accept}, and {@code id1}, {@code id3} and {@code
+   * id8} have no vector, so that a filter on {@code tag} matches documents that have no vector for
+   * {@code field}.
+   */
+  private Directory getPartiallyVectoredIndexStore(String field) throws IOException {
+    Directory indexStore = newDirectoryForTest();
+    try (IndexWriter writer =
+        new IndexWriter(indexStore, configStandardCodec().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      for (int i = 0; i < 10; ++i) {
+        Document doc = new Document();
+        doc.add(new StringField("id", "id" + i, Field.Store.YES));
+        doc.add(new StringField("tag", i < 6 ? "accept" : "other", Field.Store.NO));
+        if (i != 1 && i != 3 && i != 8) {
+          doc.add(getKnnVectorField(field, new float[] {i, i}));
+        }
+        writer.addDocument(doc);
+      }
+    }
     return indexStore;
   }
 

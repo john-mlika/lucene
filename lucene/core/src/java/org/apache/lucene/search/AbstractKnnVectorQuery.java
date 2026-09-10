@@ -76,6 +76,10 @@ abstract class AbstractKnnVectorQuery extends Query {
     IndexReader reader = indexSearcher.getIndexReader();
 
     final Weight filterWeight;
+    // Weight of a FieldExistsQuery on #field, intersected with the filter to build the accept
+    // docs. null when no intersection is needed, either because there is no filter or because
+    // every document has a value for #field.
+    final Weight vectorPresenceWeight;
     if (filter != null) {
       // rewrite inner filter query first to determine if its a match all
       // or match no docs query, so we can skip the knn search
@@ -85,22 +89,31 @@ abstract class AbstractKnnVectorQuery extends Query {
         return rewrittenFilter;
       }
       if (rewrittenFilter.getClass() != MatchAllDocsQuery.class) {
-        BooleanQuery booleanQuery =
-            new BooleanQuery.Builder()
-                .add(filter, BooleanClause.Occur.FILTER)
-                .add(new FieldExistsQuery(field), BooleanClause.Occur.FILTER)
-                .build();
-        Query rewritten = indexSearcher.rewrite(booleanQuery);
+        Query rewritten = indexSearcher.rewrite(filter);
         if (rewritten.getClass() == MatchNoDocsQuery.class) {
           return rewritten;
         }
-        filterWeight = rewritten.createWeight(indexSearcher, ScoreMode.COMPLETE_NO_SCORES, 1f);
+        // Both weights go through IndexSearcher so that the query cache applies to them. Keeping
+        // them apart rather than conjoining them into a BooleanQuery lets AcceptDocs intersect
+        // them with bulk word-level operations instead of walking a conjunction one doc at a
+        // time; the resulting accept docs are the same.
+        filterWeight = indexSearcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1f);
+        Query vectorPresence = indexSearcher.rewrite(new FieldExistsQuery(field));
+        if (vectorPresence.getClass() == MatchNoDocsQuery.class) {
+          return vectorPresence;
+        }
+        vectorPresenceWeight =
+            vectorPresence.getClass() == MatchAllDocsQuery.class
+                ? null
+                : indexSearcher.createWeight(vectorPresence, ScoreMode.COMPLETE_NO_SCORES, 1f);
       } else {
         // If the filter is a match all docs query, we can skip it
         filterWeight = null;
+        vectorPresenceWeight = null;
       }
     } else {
       filterWeight = null;
+      vectorPresenceWeight = null;
     }
 
     KnnCollectorManager knnCollectorManager = getKnnCollectorManager(k, indexSearcher);
@@ -112,7 +125,10 @@ abstract class AbstractKnnVectorQuery extends Query {
     List<LeafReaderContext> leafReaderContexts = new ArrayList<>(reader.leaves());
     List<Callable<TopDocs>> tasks = new ArrayList<>(leafReaderContexts.size());
     for (LeafReaderContext context : leafReaderContexts) {
-      tasks.add(() -> searchLeaf(context, filterWeight, timeLimitingKnnCollectorManager));
+      tasks.add(
+          () ->
+              searchLeaf(
+                  context, filterWeight, vectorPresenceWeight, timeLimitingKnnCollectorManager));
     }
     Map<Integer, TopDocs> perLeafResults = new HashMap<>();
     TopDocs topK = runSearchTasks(tasks, taskExecutor, perLeafResults, leafReaderContexts);
@@ -137,7 +153,8 @@ abstract class AbstractKnnVectorQuery extends Query {
             && perLeaf.scoreDocs[perLeaf.scoreDocs.length - 1].score >= minTopKScore) {
           // All this leaf's hits are at or above the global topK min score; explore it further
           ++reentryCount;
-          tasks.add(() -> searchLeaf(ctx, filterWeight, knnCollectorManagerPhase2));
+          tasks.add(
+              () -> searchLeaf(ctx, filterWeight, vectorPresenceWeight, knnCollectorManagerPhase2));
         } else {
           // This leaf is tapped out; discard the context from the active list so we maintain
           // correspondence between tasks and leaves
@@ -230,9 +247,11 @@ abstract class AbstractKnnVectorQuery extends Query {
   protected TopDocs searchLeaf(
       LeafReaderContext ctx,
       Weight filterWeight,
+      Weight vectorPresenceWeight,
       TimeLimitingKnnCollectorManager timeLimitingKnnCollectorManager)
       throws IOException {
-    TopDocs results = getLeafResults(ctx, filterWeight, timeLimitingKnnCollectorManager);
+    TopDocs results =
+        getLeafResults(ctx, filterWeight, vectorPresenceWeight, timeLimitingKnnCollectorManager);
     if (ctx.docBase > 0) {
       for (ScoreDoc scoreDoc : results.scoreDocs) {
         scoreDoc.doc += ctx.docBase;
@@ -244,6 +263,7 @@ abstract class AbstractKnnVectorQuery extends Query {
   private TopDocs getLeafResults(
       LeafReaderContext ctx,
       Weight filterWeight,
+      Weight vectorPresenceWeight,
       TimeLimitingKnnCollectorManager timeLimitingKnnCollectorManager)
       throws IOException {
     final LeafReader reader = ctx.reader();
@@ -256,14 +276,8 @@ abstract class AbstractKnnVectorQuery extends Query {
 
     AcceptDocs acceptDocs =
         AcceptDocs.fromIteratorSupplier(
-            () -> {
-              Scorer scorer = filterWeight.scorer(ctx);
-              if (scorer == null) {
-                return DocIdSetIterator.empty();
-              } else {
-                return scorer.iterator();
-              }
-            },
+            () -> scorerIterator(filterWeight, ctx),
+            vectorPresenceWeight == null ? null : () -> scorerIterator(vectorPresenceWeight, ctx),
             liveDocs,
             reader.maxDoc());
     final int cost = acceptDocs.cost();
@@ -300,6 +314,12 @@ abstract class AbstractKnnVectorQuery extends Query {
       // We stopped the kNN search because it visited too many nodes, so fall back to exact search
       return exactSearch(ctx, acceptDocs.iterator(), queryTimeout);
     }
+  }
+
+  private static DocIdSetIterator scorerIterator(Weight weight, LeafReaderContext ctx)
+      throws IOException {
+    Scorer scorer = weight.scorer(ctx);
+    return scorer == null ? DocIdSetIterator.empty() : scorer.iterator();
   }
 
   protected KnnCollectorManager getKnnCollectorManager(int k, IndexSearcher searcher) {
