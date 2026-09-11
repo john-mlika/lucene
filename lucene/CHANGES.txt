@@ -427,6 +427,10 @@ Improvements
 
 Optimizations
 ---------------------
+* GITHUB#XXXXX: IndexedDISI#indicesOf computes the indices of the docs of a bit set a word at a
+  time over its blocks, so a sparse vector field materializes the ordinals that a filter accepts
+  in bulk rather than by advancing to every accepted doc. (John Maurice)
+
 * GITHUB#XXXXX: A filtered vector search reads the ordinals that the filter accepts instead of
   mapping every ordinal it tests back to a doc: a graph search of a field where some docs have no
   vector materializes the accepted ordinals into a bit set when it is expected to test more
