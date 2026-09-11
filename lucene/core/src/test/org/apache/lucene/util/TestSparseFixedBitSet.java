@@ -233,6 +233,75 @@ public class TestSparseFixedBitSet extends BaseBitSetTestCase<SparseFixedBitSet>
     }
   }
 
+  public void testOrRange() {
+    // The same three blocks and sweeps as #testAndNotRange
+    final int numBits = 3 * 4096;
+    SparseFixedBitSet source = new SparseFixedBitSet(numBits);
+    for (int i = 0; i < 4096; ++i) {
+      source.set(i);
+    }
+    for (int i = 4096; i < 2 * 4096; i += 3) {
+      source.set(i);
+    }
+
+    for (int blockBoundary : new int[] {4096, 2 * 4096}) {
+      for (int sourceFrom = blockBoundary - 64; sourceFrom < blockBoundary; ++sourceFrom) {
+        for (int alignment = 0; alignment < 64; ++alignment) {
+          for (int length :
+              new int[] {
+                0,
+                TestUtil.nextInt(random(), 1, Long.SIZE - 1),
+                TestUtil.nextInt(random(), Long.SIZE, 512),
+                blockBoundary - sourceFrom,
+                blockBoundary - sourceFrom + 64
+              }) {
+            assertOrRange(source, sourceFrom, 256 + alignment, length, 1_000);
+            assertOrRange(source, sourceFrom, alignment, length, 1_000);
+            if (length > 0) {
+              assertOrRange(source, sourceFrom, alignment, length, alignment + length);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Sets every other bit of a {@code destLength}-bit set, ors the given range of {@code source}
+   * into it, and checks every bit of the result.
+   */
+  private static void assertOrRange(
+      SparseFixedBitSet source, int sourceFrom, int destFrom, int length, int destLength) {
+    FixedBitSet dest = new FixedBitSet(destLength);
+    for (int i = 0; i < dest.length(); i += 2) {
+      dest.set(i);
+    }
+    SparseFixedBitSet.orRange(source, sourceFrom, dest, destFrom, length);
+    for (int i = 0; i < dest.length(); ++i) {
+      boolean destSet = i % 2 == 0;
+      boolean expected;
+      if (i < destFrom || i >= destFrom + length) {
+        // Outside of the range, unmodified
+        expected = destSet;
+      } else {
+        expected = destSet || source.get(sourceFrom + (i - destFrom));
+      }
+      if (expected != dest.get(i)) {
+        fail(
+            "sourceFrom="
+                + sourceFrom
+                + ", destFrom="
+                + destFrom
+                + ", length="
+                + length
+                + ", destLength="
+                + destLength
+                + ", bit="
+                + i);
+      }
+    }
+  }
+
   public void testLargeValuesDoNotOverflow() {
     assertEquals(524288, SparseFixedBitSet.blockCount(2147479553));
   }
