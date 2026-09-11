@@ -433,9 +433,9 @@ Optimizations
 
 * GITHUB#XXXXX: A filtered vector search reads the ordinals that the filter accepts instead of
   mapping every ordinal it tests back to a doc: a graph search of a field where some docs have no
-  vector materializes the accepted ordinals into a bit set when it is expected to test more
-  ordinals than the filter accepts docs, and an exhaustive search scores only the accepted
-  ordinals, which the vector values enumerate. (John Maurice)
+  vector materializes the accepted ordinals into a bit set when the lookups that this saves are
+  expected to outweigh the words that walking the docs that have a vector costs, and an exhaustive
+  search scores only the accepted ordinals, which the vector values enumerate. (John Maurice)
 
 * GITHUB#16593: DenseLiveDocs and SparseLiveDocs implement Bits#applyMask in bulk, restoring the
   word-at-a-time masking that live docs had before GITHUB#13084 exposed them as LiveDocs rather than
