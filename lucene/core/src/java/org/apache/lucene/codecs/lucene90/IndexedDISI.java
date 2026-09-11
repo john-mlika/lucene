@@ -574,6 +574,51 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
     return method.docIDRunEnd(this);
   }
 
+  /**
+   * Sets in {@code indices} the {@link #index() index} of every doc of this iterator that is set in
+   * {@code docs}. The result is the same as advancing to every set bit of {@code docs} that this
+   * iterator contains and setting {@link #index()} for each, but it is computed a word at a time
+   * over the blocks of this iterator, so its cost is bounded by the number of blocks that hold a
+   * set bit of {@code docs} rather than by the number of set bits: 1,024 words for an ALL or a
+   * DENSE block, one short per doc for a SPARSE block. Blocks that hold no set bit of {@code docs}
+   * are skipped through the jump table.
+   *
+   * <p>Docs at or beyond {@code docs.length()} are not set in {@code docs}, so they contribute
+   * nothing. This iterator must not have been advanced yet, and it is exhausted afterwards.
+   *
+   * @param docs the docs to look up
+   * @param indices the bit set to set the indices in, which must have at least as many bits as this
+   *     iterator has docs
+   */
+  public void indicesOf(FixedBitSet docs, FixedBitSet indices) throws IOException {
+    assert doc == -1 : "the iterator has already been advanced to doc " + doc;
+    final int maxDoc = docs.length();
+    int target = maxDoc == 0 ? DocIdSetIterator.NO_MORE_DOCS : docs.nextSetBit(0);
+    while (target != DocIdSetIterator.NO_MORE_DOCS) {
+      final int targetBlock = target & 0xFFFF0000;
+      if (block < targetBlock) {
+        advanceBlock(targetBlock);
+      }
+      if (block != targetBlock) {
+        assert block > targetBlock;
+        // The block that holds target has no docs, move on to the first set doc of docs that this
+        // block or a later one could hold, if there is one.
+        if (block >= maxDoc) {
+          break;
+        }
+        target = docs.nextSetBit(block);
+        continue;
+      }
+      method.indicesWithinBlock(this, docs, indices);
+      final int lastDocOfBlock = block | 0xFFFF;
+      if (lastDocOfBlock >= maxDoc - 1) {
+        break;
+      }
+      target = docs.nextSetBit(lastDocOfBlock + 1);
+    }
+    doc = DocIdSetIterator.NO_MORE_DOCS;
+  }
+
   enum Method {
     SPARSE {
       @Override
@@ -644,6 +689,19 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       @Override
       int docIDRunEnd(IndexedDISI disi) throws IOException {
         return disi.doc + 1;
+      }
+
+      @Override
+      void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices)
+          throws IOException {
+        final int maxDoc = docs.length();
+        // The docs of the block have the indices from index + 1 to nextBlockIndex, inclusive
+        for (int index = disi.index + 1; index <= disi.nextBlockIndex; ++index) {
+          final int doc = disi.block | Short.toUnsignedInt(disi.slice.readShort());
+          if (doc < maxDoc && docs.get(doc)) {
+            indices.set(index);
+          }
+        }
       }
     },
     DENSE {
@@ -760,6 +818,46 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
         }
         return disi.doc + 1;
       }
+
+      @Override
+      void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices)
+          throws IOException {
+        if (disi.bitSet == null) {
+          disi.bitSet = new FixedBitSet(BLOCK_SIZE);
+        }
+        final long[] blockBits = disi.bitSet.getBits();
+        // readBlockHeader leaves the slice at the bitmap, right after the rank table
+        assert disi.slice.getFilePointer() == disi.denseBitmapOffset;
+        disi.slice.readLongs(blockBits, 0, DENSE_BLOCK_LONGS);
+        final long[] docBits = docs.getBits();
+        final long[] indexBits = indices.getBits();
+        final int firstDocWord = disi.block >> 6;
+        final int numWords =
+            Math.min(DENSE_BLOCK_LONGS, FixedBitSet.bits2words(docs.length()) - firstDocWord);
+        // The index of the first doc of the block, then of the first doc of every word
+        int index = disi.index + 1;
+        for (int i = 0; i < numWords; ++i) {
+          final long word = blockBits[i];
+          final long accepted = word & docBits[firstDocWord + i];
+          if (accepted != 0L) {
+            // The n-th set bit of word is the doc with index `index + n`, so packing the accepted
+            // bits down to the ranks of the set bits of word that they occupy gives the indices
+            // relative to index. This is a parallel bit extract, which the JIT compiles to the
+            // single PEXT instruction on x86 with BMI2.
+            final long packed = Long.compress(accepted, word);
+            final int indexWord = index >> 6;
+            final int shift = index & 0x3F;
+            indexBits[indexWord] |= packed << shift;
+            if (shift != 0) {
+              final long high = packed >>> -shift;
+              if (high != 0L) {
+                indexBits[indexWord + 1] |= high;
+              }
+            }
+          }
+          index += Long.bitCount(word);
+        }
+      }
     },
     ALL {
       @Override
@@ -792,6 +890,14 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       int docIDRunEnd(IndexedDISI disi) throws IOException {
         return (disi.doc | 0xFFFF) + 1;
       }
+
+      @Override
+      void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices) {
+        // Every doc of the block has an index, which is the doc minus the gap, so the set bits of
+        // docs over the block are the indices, shifted.
+        final int length = Math.min(BLOCK_SIZE, docs.length() - disi.block);
+        FixedBitSet.orRange(docs, disi.block, indices, disi.index + 1, length);
+      }
     };
 
     /**
@@ -820,6 +926,16 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
         IndexedDISI disi, int upTo, FixedBitSet bitSet, int offset) throws IOException;
 
     abstract int docIDRunEnd(IndexedDISI disi) throws IOException;
+
+    /**
+     * Sets in {@code indices} the index of every doc of this block that is set in {@code docs}, for
+     * {@link IndexedDISI#indicesOf}. The header of the block must have just been read by {@link
+     * #readBlockHeader()}. Afterwards, the position of {@link IndexedDISI#slice} and the status
+     * vars other than {@link IndexedDISI#block}, {@link IndexedDISI#blockEnd} and {@link
+     * IndexedDISI#nextBlockIndex} are undefined.
+     */
+    abstract void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices)
+        throws IOException;
   }
 
   /**

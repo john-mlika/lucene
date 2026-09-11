@@ -577,7 +577,273 @@ public class TestIndexedDISI extends LuceneTestCase {
       }
     }
 
+    int numIndicesOfIters = atLeast(3);
+    for (int i = 0; i < numIndicesOfIters; ++i) {
+      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+        IndexedDISI disi =
+            new IndexedDISI(in, 0L, length, jumpTableentryCount, denseRankPower, cardinality);
+        assertIndicesOf(set, randomDocs(set), disi);
+      }
+    }
+
     dir.deleteFile("foo");
+  }
+
+  /**
+   * Random docs to look up in {@code set}: a random density, over a length that may be shorter than
+   * the set, so that docs of the set beyond it are not looked up, or longer, so that docs beyond
+   * the set are looked up.
+   */
+  private static FixedBitSet randomDocs(BitSet set) {
+    Random random = random();
+    final int length;
+    switch (random.nextInt(4)) {
+      case 0:
+        length = set.length();
+        break;
+      case 1:
+        length = TestUtil.nextInt(random, 0, set.length());
+        break;
+      case 2:
+        length = set.length() + TestUtil.nextInt(random, 1, 3 << 16);
+        break;
+      default:
+        // On a word or a block boundary, or just around one
+        int boundary = random.nextBoolean() ? Long.SIZE : 1 << 16;
+        length =
+            Math.max(
+                0,
+                (set.length() / boundary) * boundary
+                    + boundary * random.nextInt(3)
+                    + TestUtil.nextInt(random, -1, 1));
+        break;
+    }
+    FixedBitSet docs = new FixedBitSet(length);
+    if (length == 0) {
+      return docs;
+    }
+    switch (random.nextInt(6)) {
+      case 0:
+        // empty
+        break;
+      case 1:
+        docs.set(0, length);
+        break;
+      case 2:
+        // A single doc
+        docs.set(random.nextInt(length));
+        break;
+      case 3:
+        {
+          // Random blocks in full, so that some blocks are skipped
+          int numBlocks = (length + 0xFFFF) >>> 16;
+          for (int block = 0; block < numBlocks; ++block) {
+            if (random.nextBoolean()) {
+              docs.set(block << 16, Math.min(length, (block + 1) << 16));
+            }
+          }
+          break;
+        }
+      case 4:
+        {
+          // Random blocks, with a random density each
+          int numBlocks = (length + 0xFFFF) >>> 16;
+          for (int block = 0; block < numBlocks; ++block) {
+            if (random.nextInt(3) == 0) {
+              continue;
+            }
+            double density = random.nextDouble();
+            int end = Math.min(length, (block + 1) << 16);
+            for (int doc = block << 16; doc < end; ++doc) {
+              if (random.nextDouble() < density) {
+                docs.set(doc);
+              }
+            }
+          }
+          break;
+        }
+      default:
+        {
+          // A random density over the whole length
+          double density = random.nextDouble();
+          for (int doc = 0; doc < length; ++doc) {
+            if (random.nextDouble() < density) {
+              docs.set(doc);
+            }
+          }
+          break;
+        }
+    }
+    return docs;
+  }
+
+  /**
+   * Asserts that {@link IndexedDISI#indicesOf} sets exactly the indices that walking {@code set}
+   * with a running index sets for the docs that are also set in {@code docs}.
+   */
+  private static void assertIndicesOf(BitSet set, FixedBitSet docs, IndexedDISI disi)
+      throws IOException {
+    final int cardinality = set.cardinality();
+    FixedBitSet expected = new FixedBitSet(cardinality);
+    int index = 0;
+    BitSetIterator it = new BitSetIterator(set, cardinality);
+    for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+      if (doc < docs.length() && docs.get(doc)) {
+        expected.set(index);
+      }
+      index++;
+    }
+    assertEquals(cardinality, index);
+
+    FixedBitSet actual = new FixedBitSet(cardinality);
+    disi.indicesOf(docs, actual);
+    assertEquals(
+        "cardinality of the indices of " + docs.cardinality() + " docs over " + docs.length(),
+        expected.cardinality(),
+        actual.cardinality());
+    assertEquals(expected, actual);
+    assertEquals(DocIdSetIterator.NO_MORE_DOCS, disi.docID());
+  }
+
+  public void testIndicesOf() throws IOException {
+    int numIters = atLeast(5);
+    for (int iter = 0; iter < numIters; ++iter) {
+      final int blockCount = TestUtil.nextInt(random(), 1, 8);
+      BitSet set = createSetWithRandomBlocks(blockCount);
+      if (set.cardinality() == 0) {
+        set.set(random().nextInt(set.length()));
+      }
+      final int cardinality = set.cardinality();
+      final byte denseRankPower =
+          rarely() ? -1 : (byte) (random().nextInt(7) + 7); // sane + chance of disable
+      try (Directory dir = newDirectory()) {
+        long length;
+        int jumpTableEntryCount;
+        try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
+          jumpTableEntryCount =
+              IndexedDISI.writeBitSet(new BitSetIterator(set, cardinality), out, denseRankPower);
+          length = out.getFilePointer();
+        }
+        int numDocSets = atLeast(10);
+        for (int i = 0; i < numDocSets; ++i) {
+          try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+            IndexedDISI disi =
+                new IndexedDISI(in, 0L, length, jumpTableEntryCount, denseRankPower, cardinality);
+            assertIndicesOf(set, randomDocs(set), disi);
+          }
+        }
+      }
+    }
+  }
+
+  public void testIndicesOfEdgeCases() throws IOException {
+    // Every block type in a row, then the same with the empty block last, then a lone block of
+    // each type
+    final int B = 1 << 16;
+    for (int[] types :
+        new int[][] {
+          {1, 2, 3, 0, 1, 3, 2},
+          {0, 0, 2, 0, 0, 3, 0, 0, 1, 0, 0},
+          {1},
+          {2},
+          {3},
+          {0, 1},
+          {0, 3},
+          {0, 2},
+          {3, 3},
+          {1, 1},
+          {2, 2}
+        }) {
+      BitSet set = new SparseFixedBitSet(types.length * B);
+      for (int block = 0; block < types.length; ++block) {
+        switch (types[block]) {
+          case 0:
+            break;
+          case 1:
+            for (int doc = block * B; doc < (block + 1) * B; ++doc) {
+              set.set(doc);
+            }
+            break;
+          case 2:
+            for (int doc = block * B; doc < (block + 1) * B; doc += 17) {
+              set.set(doc);
+            }
+            break;
+          case 3:
+            for (int doc = block * B; doc < (block + 1) * B; ++doc) {
+              if (random().nextInt(10) != 0) {
+                set.set(doc);
+              }
+            }
+            break;
+          default:
+            throw new AssertionError();
+        }
+      }
+      final int cardinality = set.cardinality();
+      final byte denseRankPower = random().nextBoolean() ? -1 : (byte) (random().nextInt(7) + 7);
+      try (Directory dir = newDirectory()) {
+        long length;
+        int jumpTableEntryCount;
+        try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
+          jumpTableEntryCount =
+              IndexedDISI.writeBitSet(new BitSetIterator(set, cardinality), out, denseRankPower);
+          length = out.getFilePointer();
+        }
+        for (FixedBitSet docs : edgeCaseDocs(set)) {
+          try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+            IndexedDISI disi =
+                new IndexedDISI(in, 0L, length, jumpTableEntryCount, denseRankPower, cardinality);
+            assertIndicesOf(set, docs, disi);
+          }
+        }
+      }
+    }
+  }
+
+  private static FixedBitSet[] edgeCaseDocs(BitSet set) {
+    final int B = 1 << 16;
+    final int length = set.length();
+    FixedBitSet empty = new FixedBitSet(length);
+    FixedBitSet full = new FixedBitSet(length);
+    full.set(0, length);
+    FixedBitSet zeroLength = new FixedBitSet(0);
+    FixedBitSet first = new FixedBitSet(length);
+    first.set(0);
+    FixedBitSet last = new FixedBitSet(length);
+    last.set(length - 1);
+    FixedBitSet shorter = new FixedBitSet(length - 1);
+    shorter.set(0, length - 1);
+    FixedBitSet longer = new FixedBitSet(length + B + 1);
+    longer.set(0, length + B + 1);
+    FixedBitSet lastBlockOnly = new FixedBitSet(length);
+    lastBlockOnly.set(length - B, length);
+    FixedBitSet firstBlockOnly = new FixedBitSet(length);
+    firstBlockOnly.set(0, B);
+    FixedBitSet wordBoundaries = new FixedBitSet(length);
+    for (int doc = 0; doc < length; doc += 64) {
+      wordBoundaries.set(doc);
+      if (doc + 63 < length) {
+        wordBoundaries.set(doc + 63);
+      }
+    }
+    FixedBitSet oddWords = new FixedBitSet(length);
+    for (int word = 1; word * 64 < length; word += 2) {
+      oddWords.set(word * 64, Math.min(length, (word + 1) * 64));
+    }
+    return new FixedBitSet[] {
+      empty,
+      full,
+      zeroLength,
+      first,
+      last,
+      shorter,
+      longer,
+      lastBlockOnly,
+      firstBlockOnly,
+      wordBoundaries,
+      oddWords
+    };
   }
 
   private void assertAdvanceExactRandomized(

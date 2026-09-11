@@ -29,6 +29,7 @@ import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.packed.DirectMonotonicReader;
 
@@ -290,6 +291,10 @@ public abstract class OffHeapByteVectorValues extends ByteVectorValues implement
         throws IOException {
       if (acceptDocs == null) {
         return null;
+      }
+      if (acceptDocs instanceof FixedBitSet fixedBitSet) {
+        // A word at a time over the blocks of the docs that have a vector
+        return configuration.getAcceptOrds(dataIn, fixedBitSet);
       }
       // Leap frog over a private view of the docs that have a vector, so that the iterator that
       // this instance hands out is left where it is.

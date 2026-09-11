@@ -59,6 +59,7 @@ import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.SameThreadExecutorService;
+import org.apache.lucene.util.SparseFixedBitSet;
 import org.apache.lucene.util.hnsw.HnswGraphSearcher;
 
 public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase {
@@ -672,7 +673,9 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
 
   /**
    * The accepted ordinals that a sparse field materializes must be the same bits as the ones it
-   * computes lazily, whether or not the accepted docs have a vector.
+   * computes lazily, whether or not the accepted docs have a vector, and whether they are
+   * materialized a word at a time from a {@link FixedBitSet} or a doc at a time from any other
+   * accepted docs.
    */
   public void testMaterializedAcceptOrds() throws IOException {
     int numDocs = 1000;
@@ -691,22 +694,32 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
             sparseReader.leaves().get(0).reader().getFloatVectorValues("field");
         for (int iter = 0; iter < 5; iter++) {
           FixedBitSet acceptDocs = new FixedBitSet(numDocs);
+          SparseFixedBitSet sparseAcceptDocs = new SparseFixedBitSet(numDocs);
           for (int doc = 0; doc < numDocs; doc++) {
             // Accepts docs with and without a vector, and never accepts them all
             if (random().nextInt(4) > 0) {
               acceptDocs.set(doc);
+              sparseAcceptDocs.set(doc);
             }
           }
           Bits lazy = sparseValues.getAcceptOrds(acceptDocs);
           Bits materialized =
               sparseValues.getAcceptOrds(
                   acceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality()));
+          Bits leapFrogged =
+              sparseValues.getAcceptOrds(
+                  sparseAcceptDocs,
+                  new BitSetIterator(sparseAcceptDocs, sparseAcceptDocs.cardinality()));
           assertNotSame(lazy, materialized);
+          assertNotSame(lazy, leapFrogged);
           assertEquals(sparseValues.size(), lazy.length());
           assertEquals(sparseValues.size(), materialized.length());
+          assertEquals(sparseValues.size(), leapFrogged.length());
           for (int ord = 0; ord < sparseValues.size(); ord++) {
             assertEquals("ord=" + ord, lazy.get(ord), materialized.get(ord));
+            assertEquals("ord=" + ord, lazy.get(ord), leapFrogged.get(ord));
           }
+          assertEquals(materialized, leapFrogged);
         }
         assertNull(sparseValues.getAcceptOrds(null, DocIdSetIterator.all(numDocs)));
 

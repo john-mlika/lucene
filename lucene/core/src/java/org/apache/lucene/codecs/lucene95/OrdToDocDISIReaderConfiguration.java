@@ -24,6 +24,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.packed.DirectMonotonicReader;
 import org.apache.lucene.util.packed.DirectMonotonicWriter;
 
@@ -197,6 +198,22 @@ public class OrdToDocDISIReaderConfiguration {
         jumpTableEntryCount,
         denseRankPower,
         size);
+  }
+
+  /**
+   * Returns the ordinals of the vectors whose doc is set in {@code acceptDocs}, computed a word at
+   * a time over the blocks of the docs that have a vector rather than a doc at a time, see {@link
+   * IndexedDISI#indicesOf}.
+   *
+   * @param dataIn the dataIn
+   * @param acceptDocs the accepted docs
+   * @return a bit set of {@code size} bits over the ordinals
+   * @throws IOException thrown when reading data fails
+   */
+  public FixedBitSet getAcceptOrds(IndexInput dataIn, FixedBitSet acceptDocs) throws IOException {
+    FixedBitSet acceptOrds = new FixedBitSet(size);
+    getIndexedDISI(dataIn).indicesOf(acceptDocs, acceptOrds);
+    return acceptOrds;
   }
 
   /**
