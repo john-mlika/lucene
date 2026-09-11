@@ -359,6 +359,11 @@ Other
 API Changes
 ---------------------
 
+* GITHUB#XXXXX: FlatVectorsWriter gains mergeOneFlatVectorFieldForMergeScorer and the
+  FlatVectorsWriter.MergeScorerData handle it returns, so that a flat writer can prepare what a
+  merge scorer over the merged vectors needs while it writes them. The default prepares nothing;
+  a writer that wraps another one should forward the new method too. (John Maurice)
+
 * GITHUB#14399: Add a default LeafFieldComparator#disableSkipping method so document skipping can be
   disabled per segment. (Serhiy Bzhezytskyy)
 
@@ -509,6 +514,10 @@ Optimizations
 
 * GITHUB#16582: Rewrite sorted-numeric doc-values range queries that cover every value of a field to a
   FieldExistsQuery, and collapse an IndexOrDocValuesQuery whose two sides rewrite equally. (Houston Putman)
+
+* GITHUB#XXXXX: Merging an HNSW graph over Lucene104HnswScalarQuantizedVectorsFormat with an
+  asymmetric encoding of a float32 field no longer reads the merged vectors back to build the merge
+  scorer. (John Maurice)
 
 Bug Fixes
 ---------------------
