@@ -38,6 +38,7 @@ import org.apache.lucene.codecs.hnsw.FlatVectorsFormat;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
+import org.apache.lucene.codecs.hnsw.FlatVectorsWriter.MergeScorerData;
 import org.apache.lucene.index.DocsWithFieldSet;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexFileNames;
@@ -90,6 +91,14 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
   private final int version;
 
   private final List<FieldWriter<?>> fields = new ArrayList<>();
+
+  /**
+   * The merge scorer data the flat writer prepared, so that a field that never hands it to a
+   * supplier still has it released by {@link #close()}. A handle a supplier did take over ignores
+   * being closed again.
+   */
+  private final List<MergeScorerData> preparedMergeScorers = new ArrayList<>();
+
   private boolean finished;
 
   public Lucene99HnswVectorsWriter(
@@ -417,7 +426,19 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
 
   @Override
   public IORunnable mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
-    flatVectorWriter.mergeOneFlatVectorField(fieldInfo, mergeState);
+    // Let the flat writer prepare the merge scorer's data as it writes the merged vectors, if it
+    // can and if this merge will build a graph over them.
+    MergeScorerData mergeScorerData =
+        flatVectorWriter.mergeOneFlatVectorFieldForMergeScorer(
+            fieldInfo, mergeState, this::buildsGraph);
+    if (mergeScorerData != null) {
+      try {
+        preparedMergeScorers.add(mergeScorerData);
+      } catch (Throwable t) {
+        IOUtils.closeWhileSuppressingExceptions(t, mergeScorerData);
+        throw t;
+      }
+    }
     return () -> {
       // Bail out before the potentially heavy graph build if the merge was already aborted
       mergeState.checkAborted();
@@ -431,20 +452,17 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
             case FLOAT32 -> flatVectorsReader.getFloatVectorValues(fieldInfo.name);
           };
       int totalVectorCount = vectorValues == null ? 0 : vectorValues.size();
-      if (totalVectorCount > 0 && shouldCreateGraph(tinySegmentsThreshold, totalVectorCount)) {
-        if (flatVectorsReader instanceof QuantizedVectorsReader quantizedVectorsReader
-            && fieldInfo.getVectorEncoding().equals(VectorEncoding.FLOAT32)) {
-          CloseableRandomVectorScorerSupplier scorerSupplier =
-              quantizedVectorsReader.getRandomVectorScorerSupplierForMerge(
-                  fieldInfo, segmentWriteState);
+      if (buildsGraph(totalVectorCount)) {
+        CloseableRandomVectorScorerSupplier mergeScorer =
+            mergeScorerSupplier(fieldInfo, mergeScorerData);
+        if (mergeScorer != null) {
           try {
-            buildAndWriteGraph(
-                fieldInfo, mergeState, vectorValues, scorerSupplier, totalVectorCount);
+            buildAndWriteGraph(fieldInfo, mergeState, vectorValues, mergeScorer, totalVectorCount);
           } catch (Throwable t) {
-            IOUtils.closeWhileSuppressingExceptions(t, scorerSupplier);
+            IOUtils.closeWhileSuppressingExceptions(t, mergeScorer);
             throw t;
           }
-          IOUtils.close(scorerSupplier);
+          IOUtils.close(mergeScorer);
         } else {
           RandomVectorScorerSupplier scorerSupplier =
               flatVectorsReader
@@ -457,6 +475,26 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         writeMeta(fieldInfo, vectorIndex.getFilePointer(), 0L, totalVectorCount, null, null);
       }
     };
+  }
+
+  /**
+   * The merge scorer for the field: the one the flat writer prepared, else the one the reader
+   * builds from the merged vectors, else none.
+   */
+  private CloseableRandomVectorScorerSupplier mergeScorerSupplier(
+      FieldInfo fieldInfo, MergeScorerData prepared) throws IOException {
+    if (prepared != null) {
+      CloseableRandomVectorScorerSupplier supplier = prepared.scorerSupplier(flatVectorsReader);
+      if (supplier != null) {
+        return supplier;
+      }
+    }
+    if (flatVectorsReader instanceof QuantizedVectorsReader quantizedVectorsReader
+        && fieldInfo.getVectorEncoding().equals(VectorEncoding.FLOAT32)) {
+      return quantizedVectorsReader.getRandomVectorScorerSupplierForMerge(
+          fieldInfo, segmentWriteState);
+    }
+    return null;
   }
 
   private void buildAndWriteGraph(
@@ -651,10 +689,17 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
 
   @Override
   public void close() throws IOException {
-    if (flatWriterClosed) {
-      IOUtils.close(meta, vectorIndex, flatVectorsReader);
-    } else {
-      IOUtils.close(meta, vectorIndex, flatVectorWriter, flatVectorsReader);
+    try {
+      if (flatWriterClosed) {
+        IOUtils.close(meta, vectorIndex, flatVectorsReader);
+      } else {
+        IOUtils.close(meta, vectorIndex, flatVectorWriter, flatVectorsReader);
+      }
+    } finally {
+      // Releases the merge scorer data of every field that never handed it to a supplier: a merge
+      // that was aborted, a field whose merged count turned out not to need a graph, or a field
+      // left behind after another field's graph build threw.
+      IOUtils.closeWhileHandlingException(preparedMergeScorers);
     }
   }
 
@@ -665,6 +710,11 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       }
     }
     throw new IllegalArgumentException("invalid distance function: " + func);
+  }
+
+  /** Whether this merge builds a graph over a field of {@code numVectors} merged vectors. */
+  private boolean buildsGraph(int numVectors) {
+    return numVectors > 0 && shouldCreateGraph(tinySegmentsThreshold, numVectors);
   }
 
   private static boolean shouldCreateGraph(int k, int numNodes) {

@@ -16,6 +16,7 @@
  */
 package org.apache.lucene.index;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -26,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.codecs.lucene104.Lucene104HnswScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -37,6 +39,7 @@ import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.InfoStream;
 import org.apache.lucene.util.NamedThreadFactory;
 import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding;
 
 /**
  * Tests that aborting a merge (e.g. via {@link IndexWriter#rollback()}) interrupts HNSW graph
@@ -97,6 +100,24 @@ public class TestHnswMergeAbort extends LuceneTestCase {
       mergeExec.shutdown();
       assertTrue(mergeExec.awaitTermination(30, TimeUnit.SECONDS));
     }
+  }
+
+  /**
+   * An asymmetric scalar encoding builds its graph from a merge scorer whose query-side records the
+   * flat writer wrote into a temporary file while it wrote the merged vectors. The aborted build
+   * must release that file, which is what the leftover check in the harness below covers.
+   */
+  public void testRollbackDuringQuantizedMerge() throws Exception {
+    doTestRollbackDuringMerge(
+        true,
+        new Lucene104HnswScalarQuantizedVectorsFormat(
+            ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE,
+            16,
+            BEAM_WIDTH,
+            1,
+            null,
+            TINY_SEGMENTS_THRESHOLD),
+        "build graph from " + LIVE_DOCS_AFTER_DELETES + " vectors");
   }
 
   private void doTestRollbackDuringMerge(
@@ -183,9 +204,21 @@ public class TestHnswMergeAbort extends LuceneTestCase {
                 }
               });
       merger.start();
+      List<String> midMerge = List.of();
       try {
         assertTrue(
             "HNSW graph construction never started", buildStarted.await(120, TimeUnit.SECONDS));
+        // The merge thread is parked at the start of the build, so the hand-off file it created is
+        // still in the directory; read it here so that the check at the end of this test can name
+        // it. That check is not by itself proof that the abort released the file - rollback sweeps
+        // an unreferenced temporary file anyway - but the file is open until it is released, and
+        // MockDirectoryWrapper fails a directory closed with an open file.
+        midMerge = tempFiles(dir);
+        if (format instanceof Lucene104HnswScalarQuantizedVectorsFormat) {
+          assertFalse(
+              "the quantized merge wrote no hand-off file for the abort to release",
+              midMerge.isEmpty());
+        }
         w2.rollback();
         assertTrue("merge thread was not released by the abort signal", releasedAfterAbort.get());
         synchronized (hnswMessages) {
@@ -210,6 +243,20 @@ public class TestHnswMergeAbort extends LuceneTestCase {
         merger.join(TimeUnit.MINUTES.toMillis(5));
         assertFalse("merge thread did not terminate", merger.isAlive());
       }
+      assertEquals(
+          "a temporary file outlived the aborted merge, which had " + midMerge + " mid-build",
+          List.of(),
+          tempFiles(dir));
     }
+  }
+
+  private static List<String> tempFiles(Directory dir) throws IOException {
+    List<String> temps = new ArrayList<>();
+    for (String file : dir.listAll()) {
+      if (file.endsWith(".tmp")) {
+        temps.add(file);
+      }
+    }
+    return temps;
   }
 }

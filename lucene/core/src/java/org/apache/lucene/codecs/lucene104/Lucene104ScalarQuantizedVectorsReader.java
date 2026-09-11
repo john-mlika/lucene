@@ -52,6 +52,7 @@ import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FileDataHint;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
@@ -561,36 +562,66 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
       }
       throw t;
     }
-    IndexInput quantizedScoreDataInput =
-        segmentWriteState.directory.openInput(
-            tempScoreQuantizedVectorName, segmentWriteState.context);
+    assert docsWithField.cardinality() == vectorValues.size();
+    return mergeScorerSupplier(
+        fieldInfo,
+        vectorValues,
+        vectorScorer,
+        segmentWriteState.directory,
+        segmentWriteState.context,
+        tempScoreQuantizedVectorName);
+  }
+
+  /**
+   * Builds a merge scorer supplier that scores query-side records, written to {@code queryDataName}
+   * in the layout {@link #writeBinarizedQueryData} writes, against a segment's own {@code
+   * indexVectors}. Takes over that file: the returned supplier deletes it when it is closed, and
+   * this deletes it if it throws.
+   */
+  static CloseableRandomVectorScorerSupplier mergeScorerSupplier(
+      FieldInfo fieldInfo,
+      QuantizedByteVectorValues indexVectors,
+      Lucene104ScalarQuantizedVectorScorer vectorScorer,
+      Directory directory,
+      IOContext context,
+      String queryDataName)
+      throws IOException {
+    IndexInput queryData = null;
     try {
-      OffHeapScalarQuantizedVectorValues scoreVectorValues =
+      queryData = directory.openInput(queryDataName, context);
+      // both sides hold one record per vector of the field
+      OffHeapScalarQuantizedVectorValues queryVectors =
           new OffHeapScalarQuantizedVectorValues.DenseOffHeapVectorValues(
               true,
               fieldInfo.getVectorDimension(),
-              docsWithField.cardinality(),
-              vectorValues.getCentroid(),
-              vectorValues.getCentroidDP(),
-              quantizer,
-              fi.scalarEncoding,
+              indexVectors.size(),
+              indexVectors.getCentroid(),
+              indexVectors.getCentroidDP(),
+              new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction()),
+              indexVectors.getScalarEncoding(),
               fieldInfo.getVectorSimilarityFunction(),
               vectorScorer,
-              quantizedScoreDataInput);
+              queryData);
       RandomVectorScorerSupplier scorerSupplier =
           vectorScorer.getRandomVectorScorerSupplier(
-              fieldInfo.getVectorSimilarityFunction(), scoreVectorValues, vectorValues);
-      final String finalTempScoreQuantizedVectorName = tempScoreQuantizedVectorName;
+              fieldInfo.getVectorSimilarityFunction(), queryVectors, indexVectors);
+      final IndexInput queryDataInput = queryData;
       return CloseableRandomVectorScorerSupplier.create(
           scorerSupplier,
-          vectorValues.size(),
+          indexVectors.size(),
           () -> {
-            IOUtils.close(quantizedScoreDataInput);
-            IOUtils.deleteFilesIgnoringExceptions(
-                segmentWriteState.directory, finalTempScoreQuantizedVectorName);
+            try {
+              IOUtils.close(queryDataInput);
+            } finally {
+              IOUtils.deleteFilesIgnoringExceptions(directory, queryDataName);
+            }
           });
     } catch (Throwable t) {
-      IOUtils.closeWhileSuppressingExceptions(t, quantizedScoreDataInput);
+      try {
+        IOUtils.closeWhileSuppressingExceptions(t, queryData);
+      } finally {
+        IOUtils.deleteFilesIgnoringExceptions(directory, queryDataName);
+      }
       throw t;
     }
   }
