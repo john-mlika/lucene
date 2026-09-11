@@ -25,10 +25,12 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.MathUtil;
 import org.apache.lucene.util.RoaringDocIdSet;
+import org.apache.lucene.util.SparseFixedBitSet;
 
 /**
  * Disk-based implementation of a {@link DocIdSetIterator} which can return the index of the current
@@ -583,15 +585,32 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
    * DENSE block, one short per doc for a SPARSE block. Blocks that hold no set bit of {@code docs}
    * are skipped through the jump table.
    *
+   * <p>The words are those of a {@link FixedBitSet}. The docs of a block of a {@link
+   * SparseFixedBitSet} are first copied into a scratch of one block, a word at a time too, see
+   * {@link SparseFixedBitSet#orRange}. No other kind of bit set is supported.
+   *
    * <p>Docs at or beyond {@code docs.length()} are not set in {@code docs}, so they contribute
    * nothing. This iterator must not have been advanced yet, and it is exhausted afterwards.
    *
-   * @param docs the docs to look up
+   * @param docs the docs to look up, a {@link FixedBitSet} or a {@link SparseFixedBitSet}
    * @param indices the bit set to set the indices in, which must have at least as many bits as this
    *     iterator has docs
+   * @throws IllegalArgumentException if {@code docs} is neither a {@link FixedBitSet} nor a {@link
+   *     SparseFixedBitSet}
    */
-  public void indicesOf(FixedBitSet docs, FixedBitSet indices) throws IOException {
+  public void indicesOf(BitSet docs, FixedBitSet indices) throws IOException {
     assert doc == -1 : "the iterator has already been advanced to doc " + doc;
+    final FixedBitSet fixedDocs;
+    final SparseFixedBitSet sparseDocs;
+    if (docs instanceof FixedBitSet fixedBitSet) {
+      fixedDocs = fixedBitSet;
+      sparseDocs = null;
+    } else if (docs instanceof SparseFixedBitSet sparseFixedBitSet) {
+      fixedDocs = new FixedBitSet(BLOCK_SIZE);
+      sparseDocs = sparseFixedBitSet;
+    } else {
+      throw new IllegalArgumentException("unsupported bit set: " + docs.getClass().getName());
+    }
     final int maxDoc = docs.length();
     int target = maxDoc == 0 ? DocIdSetIterator.NO_MORE_DOCS : docs.nextSetBit(0);
     while (target != DocIdSetIterator.NO_MORE_DOCS) {
@@ -609,7 +628,17 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
         target = docs.nextSetBit(block);
         continue;
       }
-      method.indicesWithinBlock(this, docs, indices);
+      final int docsOffset;
+      if (sparseDocs == null) {
+        docsOffset = 0;
+      } else {
+        // The docs of this block, a word at a time, at the start of the scratch
+        docsOffset = block;
+        fixedDocs.clear();
+        SparseFixedBitSet.orRange(
+            sparseDocs, block, fixedDocs, 0, Math.min(BLOCK_SIZE, maxDoc - block));
+      }
+      method.indicesWithinBlock(this, fixedDocs, docsOffset, maxDoc, indices);
       final int lastDocOfBlock = block | 0xFFFF;
       if (lastDocOfBlock >= maxDoc - 1) {
         break;
@@ -692,13 +721,13 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       }
 
       @Override
-      void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices)
+      void indicesWithinBlock(
+          IndexedDISI disi, FixedBitSet docs, int docsOffset, int maxDoc, FixedBitSet indices)
           throws IOException {
-        final int maxDoc = docs.length();
         // The docs of the block have the indices from index + 1 to nextBlockIndex, inclusive
         for (int index = disi.index + 1; index <= disi.nextBlockIndex; ++index) {
           final int doc = disi.block | Short.toUnsignedInt(disi.slice.readShort());
-          if (doc < maxDoc && docs.get(doc)) {
+          if (doc < maxDoc && docs.get(doc - docsOffset)) {
             indices.set(index);
           }
         }
@@ -820,7 +849,8 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       }
 
       @Override
-      void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices)
+      void indicesWithinBlock(
+          IndexedDISI disi, FixedBitSet docs, int docsOffset, int maxDoc, FixedBitSet indices)
           throws IOException {
         if (disi.bitSet == null) {
           disi.bitSet = new FixedBitSet(BLOCK_SIZE);
@@ -831,9 +861,9 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
         disi.slice.readLongs(blockBits, 0, DENSE_BLOCK_LONGS);
         final long[] docBits = docs.getBits();
         final long[] indexBits = indices.getBits();
-        final int firstDocWord = disi.block >> 6;
+        final int firstDocWord = (disi.block - docsOffset) >> 6;
         final int numWords =
-            Math.min(DENSE_BLOCK_LONGS, FixedBitSet.bits2words(docs.length()) - firstDocWord);
+            Math.min(DENSE_BLOCK_LONGS, FixedBitSet.bits2words(maxDoc - docsOffset) - firstDocWord);
         // The index of the first doc of the block, then of the first doc of every word
         int index = disi.index + 1;
         for (int i = 0; i < numWords; ++i) {
@@ -892,11 +922,12 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       }
 
       @Override
-      void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices) {
+      void indicesWithinBlock(
+          IndexedDISI disi, FixedBitSet docs, int docsOffset, int maxDoc, FixedBitSet indices) {
         // Every doc of the block has an index, which is the doc minus the gap, so the set bits of
         // docs over the block are the indices, shifted.
-        final int length = Math.min(BLOCK_SIZE, docs.length() - disi.block);
-        FixedBitSet.orRange(docs, disi.block, indices, disi.index + 1, length);
+        final int length = Math.min(BLOCK_SIZE, maxDoc - disi.block);
+        FixedBitSet.orRange(docs, disi.block - docsOffset, indices, disi.index + 1, length);
       }
     };
 
@@ -929,12 +960,14 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
 
     /**
      * Sets in {@code indices} the index of every doc of this block that is set in {@code docs}, for
-     * {@link IndexedDISI#indicesOf}. The header of the block must have just been read by {@link
-     * #readBlockHeader()}. Afterwards, the position of {@link IndexedDISI#slice} and the status
-     * vars other than {@link IndexedDISI#block}, {@link IndexedDISI#blockEnd} and {@link
+     * {@link IndexedDISI#indicesOf}. Doc {@code d} is bit {@code d - docsOffset} of {@code docs},
+     * and docs at or beyond {@code maxDoc} are not set. The header of the block must have just been
+     * read by {@link #readBlockHeader()}. Afterwards, the position of {@link IndexedDISI#slice} and
+     * the status vars other than {@link IndexedDISI#block}, {@link IndexedDISI#blockEnd} and {@link
      * IndexedDISI#nextBlockIndex} are undefined.
      */
-    abstract void indicesWithinBlock(IndexedDISI disi, FixedBitSet docs, FixedBitSet indices)
+    abstract void indicesWithinBlock(
+        IndexedDISI disi, FixedBitSet docs, int docsOffset, int maxDoc, FixedBitSet indices)
         throws IOException;
   }
 

@@ -803,6 +803,88 @@ public class SparseFixedBitSet extends BitSet {
     }
   }
 
+  /**
+   * Or the bits of {@code source} in the range {@code [sourceFrom, sourceFrom + length)} into
+   * {@code dest} starting at {@code destFrom}: sets bit {@code destFrom + i} of {@code dest} for
+   * every {@code i} in {@code [0, length)} such that bit {@code sourceFrom + i} of {@code source}
+   * is set.
+   *
+   * <p>Only non-zero longs of {@code source} overlapping the range are visited, so cost is bounded
+   * by {@code length / 64} and does not depend on how many bits of {@code source} are set. This is
+   * the counterpart of {@link FixedBitSet#orRange} for a sparse source.
+   *
+   * @throws IndexOutOfBoundsException if {@code sourceFrom + length} exceeds {@code
+   *     source.length()} or {@code destFrom + length} exceeds {@code dest.length()}
+   */
+  public static void orRange(
+      SparseFixedBitSet source, int sourceFrom, FixedBitSet dest, int destFrom, int length) {
+    assert length >= 0 : length;
+    Objects.checkFromIndexSize(sourceFrom, length, source.length());
+    Objects.checkFromIndexSize(destFrom, length, dest.length());
+
+    if (length == 0) {
+      return;
+    }
+
+    final long[] destBits = dest.getBits();
+    final int sourceTo = sourceFrom + length;
+    final int firstLong = sourceFrom >>> 6;
+    final int lastLong = (sourceTo - 1) >>> 6;
+    final int firstBlock = sourceFrom >>> 12;
+    final int lastBlock = (sourceTo - 1) >>> 12;
+    // See #andNotRange for how the longs of source map to the longs of dest.
+    final int delta = destFrom - sourceFrom;
+    final int destLongDelta = delta >> 6;
+    final int shift = delta & 0x3F;
+
+    for (int i4096 = firstBlock; i4096 <= lastBlock; ++i4096) {
+      final long index = source.indices[i4096];
+      if (index == 0) {
+        continue;
+      }
+      final long[] bitArray = source.bits[i4096];
+      long inRange = index;
+      if (i4096 == firstBlock) {
+        inRange &= -1L << firstLong; // shifts are mod 64
+      }
+      if (i4096 == lastBlock) {
+        inRange &= -1L >>> -(lastLong + 1); // shifts are mod 64
+      }
+
+      for (long remaining = inRange; remaining != 0; remaining &= remaining - 1) {
+        final int i = Long.numberOfTrailingZeros(remaining);
+        final int i64 = (i4096 << 6) | i;
+        long word = bitArray[Long.bitCount(index & ((1L << i) - 1))];
+        if (i64 == firstLong) {
+          word &= -1L << sourceFrom; // shifts are mod 64
+        }
+        if (i64 == lastLong) {
+          word &= -1L >>> -sourceTo; // shifts are mod 64
+        }
+        if (word == 0) {
+          continue;
+        }
+
+        final int destLong = i64 + destLongDelta;
+        assert destLong < destBits.length;
+        final long lowBits = word << shift;
+        if (destLong >= 0) {
+          destBits[destLong] |= lowBits;
+        } else {
+          assert lowBits == 0;
+        }
+        if (shift != 0) {
+          final long highBits = word >>> -shift;
+          if (destLong + 1 < destBits.length) {
+            destBits[destLong + 1] |= highBits;
+          } else {
+            assert highBits == 0;
+          }
+        }
+      }
+    }
+  }
+
   @Override
   public long ramBytesUsed() {
     return ramBytesUsed;

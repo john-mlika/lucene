@@ -444,9 +444,9 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
    * that holds an accepted doc, plus a bit set of {@code graphSize} bits to allocate and zero. That
    * cost depends on how many blocks the accepted docs span and not on how many there are, so it is
    * at most about {@code maxDoc / 64} words for any filter, and it saves one lookup per test. Both
-   * sides are counted in word operations. Accepted docs that are not a {@code FixedBitSet} are leap
-   * frogged a doc at a time instead; the accept docs that Lucene builds only fall back to a sparse
-   * bit set below {@code maxDoc / 128} docs, which is of the same order.
+   * sides are counted in word operations. The accepted docs are walked that way whether they are a
+   * {@code FixedBitSet} or a {@code SparseFixedBitSet}, which is what the accept docs that Lucene
+   * builds are; any other bits are leap frogged a doc at a time instead.
    *
    * @param filteredDocCount the number of docs that pass the filter
    * @param graphSize the number of nodes in the graph

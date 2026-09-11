@@ -739,23 +739,43 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
               sparseAcceptDocs.set(doc);
             }
           }
+          // Accept docs that are not a bit set are leap frogged a doc at a time
+          Bits plainAcceptDocs =
+              new Bits() {
+                @Override
+                public boolean get(int index) {
+                  return acceptDocs.get(index);
+                }
+
+                @Override
+                public int length() {
+                  return acceptDocs.length();
+                }
+              };
           Bits lazy = sparseValues.getAcceptOrds(acceptDocs);
           Bits materialized =
               sparseValues.getAcceptOrds(
                   acceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality()));
-          Bits leapFrogged =
+          Bits sparseMaterialized =
               sparseValues.getAcceptOrds(
                   sparseAcceptDocs,
                   new BitSetIterator(sparseAcceptDocs, sparseAcceptDocs.cardinality()));
+          Bits leapFrogged =
+              sparseValues.getAcceptOrds(
+                  plainAcceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality()));
           assertNotSame(lazy, materialized);
+          assertNotSame(lazy, sparseMaterialized);
           assertNotSame(lazy, leapFrogged);
           assertEquals(sparseValues.size(), lazy.length());
           assertEquals(sparseValues.size(), materialized.length());
+          assertEquals(sparseValues.size(), sparseMaterialized.length());
           assertEquals(sparseValues.size(), leapFrogged.length());
           for (int ord = 0; ord < sparseValues.size(); ord++) {
             assertEquals("ord=" + ord, lazy.get(ord), materialized.get(ord));
+            assertEquals("ord=" + ord, lazy.get(ord), sparseMaterialized.get(ord));
             assertEquals("ord=" + ord, lazy.get(ord), leapFrogged.get(ord));
           }
+          assertEquals(materialized, sparseMaterialized);
           assertEquals(materialized, leapFrogged);
         }
         assertNull(sparseValues.getAcceptOrds(null, DocIdSetIterator.all(numDocs)));

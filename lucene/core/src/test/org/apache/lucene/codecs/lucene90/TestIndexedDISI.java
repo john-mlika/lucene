@@ -579,14 +579,109 @@ public class TestIndexedDISI extends LuceneTestCase {
 
     int numIndicesOfIters = atLeast(3);
     for (int i = 0; i < numIndicesOfIters; ++i) {
-      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
-        IndexedDISI disi =
-            new IndexedDISI(in, 0L, length, jumpTableentryCount, denseRankPower, cardinality);
-        assertIndicesOf(set, randomDocs(set), disi);
+      for (BitSet docs : fixedAndSparse(randomDocs(set))) {
+        try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+          IndexedDISI disi =
+              new IndexedDISI(in, 0L, length, jumpTableentryCount, denseRankPower, cardinality);
+          assertIndicesOf(set, docs, disi);
+        }
       }
     }
 
     dir.deleteFile("foo");
+  }
+
+  /**
+   * {@code docs} as itself and as a {@link SparseFixedBitSet} with the same bits, so that {@link
+   * IndexedDISI#indicesOf} is checked over both kinds of bit set. A sparse bit set cannot be empty,
+   * so only the fixed one is returned for a length of 0.
+   */
+  private static BitSet[] fixedAndSparse(FixedBitSet docs) throws IOException {
+    if (docs.length() == 0) {
+      return new BitSet[] {docs};
+    }
+    SparseFixedBitSet sparse = new SparseFixedBitSet(docs.length());
+    sparse.or(new BitSetIterator(docs, docs.cardinality()));
+    assertEquals(docs.cardinality(), sparse.cardinality());
+    return new BitSet[] {docs, sparse};
+  }
+
+  public void testIndicesOfRejectsOtherBitSets() throws IOException {
+    FixedBitSet set = new FixedBitSet(100);
+    set.set(0, 100);
+    try (Directory dir = newDirectory()) {
+      long length;
+      int jumpTableEntryCount;
+      try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
+        jumpTableEntryCount =
+            IndexedDISI.writeBitSet(
+                new BitSetIterator(set, 100), out, IndexedDISI.DEFAULT_DENSE_RANK_POWER);
+        length = out.getFilePointer();
+      }
+      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+        IndexedDISI disi =
+            new IndexedDISI(
+                in, 0L, length, jumpTableEntryCount, IndexedDISI.DEFAULT_DENSE_RANK_POWER, 100);
+        BitSet other =
+            new BitSet() {
+              @Override
+              public void set(int i) {}
+
+              @Override
+              public boolean getAndSet(int i) {
+                return false;
+              }
+
+              @Override
+              public void clear(int i) {}
+
+              @Override
+              public void clear(int startIndex, int endIndex) {}
+
+              @Override
+              public int cardinality() {
+                return 0;
+              }
+
+              @Override
+              public int approximateCardinality() {
+                return 0;
+              }
+
+              @Override
+              public int prevSetBit(int index) {
+                return -1;
+              }
+
+              @Override
+              public int nextSetBit(int start, int upperBound) {
+                return DocIdSetIterator.NO_MORE_DOCS;
+              }
+
+              @Override
+              public int nextClearBit(int start, int upperBound) {
+                return start;
+              }
+
+              @Override
+              public long ramBytesUsed() {
+                return 0;
+              }
+
+              @Override
+              public boolean get(int index) {
+                return false;
+              }
+
+              @Override
+              public int length() {
+                return 100;
+              }
+            };
+        expectThrows(
+            IllegalArgumentException.class, () -> disi.indicesOf(other, new FixedBitSet(100)));
+      }
+    }
   }
 
   /**
@@ -681,7 +776,7 @@ public class TestIndexedDISI extends LuceneTestCase {
    * Asserts that {@link IndexedDISI#indicesOf} sets exactly the indices that walking {@code set}
    * with a running index sets for the docs that are also set in {@code docs}.
    */
-  private static void assertIndicesOf(BitSet set, FixedBitSet docs, IndexedDISI disi)
+  private static void assertIndicesOf(BitSet set, BitSet docs, IndexedDISI disi)
       throws IOException {
     final int cardinality = set.cardinality();
     FixedBitSet expected = new FixedBitSet(cardinality);
@@ -726,10 +821,12 @@ public class TestIndexedDISI extends LuceneTestCase {
         }
         int numDocSets = atLeast(10);
         for (int i = 0; i < numDocSets; ++i) {
-          try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
-            IndexedDISI disi =
-                new IndexedDISI(in, 0L, length, jumpTableEntryCount, denseRankPower, cardinality);
-            assertIndicesOf(set, randomDocs(set), disi);
+          for (BitSet docs : fixedAndSparse(randomDocs(set))) {
+            try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+              IndexedDISI disi =
+                  new IndexedDISI(in, 0L, length, jumpTableEntryCount, denseRankPower, cardinality);
+              assertIndicesOf(set, docs, disi);
+            }
           }
         }
       }
@@ -790,11 +887,13 @@ public class TestIndexedDISI extends LuceneTestCase {
               IndexedDISI.writeBitSet(new BitSetIterator(set, cardinality), out, denseRankPower);
           length = out.getFilePointer();
         }
-        for (FixedBitSet docs : edgeCaseDocs(set)) {
-          try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
-            IndexedDISI disi =
-                new IndexedDISI(in, 0L, length, jumpTableEntryCount, denseRankPower, cardinality);
-            assertIndicesOf(set, docs, disi);
+        for (FixedBitSet fixedDocs : edgeCaseDocs(set)) {
+          for (BitSet docs : fixedAndSparse(fixedDocs)) {
+            try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+              IndexedDISI disi =
+                  new IndexedDISI(in, 0L, length, jumpTableEntryCount, denseRankPower, cardinality);
+              assertIndicesOf(set, docs, disi);
+            }
           }
         }
       }

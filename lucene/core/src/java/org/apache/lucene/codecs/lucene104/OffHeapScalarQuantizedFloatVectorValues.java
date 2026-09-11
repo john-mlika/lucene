@@ -348,9 +348,11 @@ abstract class OffHeapScalarQuantizedFloatVectorValues extends FloatVectorValues
       if (acceptDocs == null) {
         return null;
       }
-      if (acceptDocs instanceof FixedBitSet fixedBitSet) {
-        // A word at a time over the blocks of the docs that have a vector
-        return configuration.getAcceptOrds(dataIn, fixedBitSet);
+      // A word at a time over the blocks of the docs that have a vector, when acceptDocs is a
+      // bit set whose words can be walked
+      FixedBitSet acceptOrds = configuration.getAcceptOrds(dataIn, acceptDocs);
+      if (acceptOrds != null) {
+        return acceptOrds;
       }
       // Leap frog over a private view of the docs that have a vector, so that the iterator that
       // this instance hands out is left where it is.
