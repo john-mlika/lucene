@@ -176,7 +176,7 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
         }
         int accepted = sparseAccepted.cardinality();
         assertEquals(accepted, denseAccepted.cardinality());
-        assertGraphSearchMaterializesAcceptedOrds(accepted, numVectors, k);
+        assertGraphSearchMaterializesAcceptedOrds(accepted, numVectors, k, numDocs);
 
         // The visited limit is unlimited, so nothing here can fall back to an exact search
         TopDocs sparseDocs =
@@ -206,7 +206,7 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
         // frog and in the filter size, and none of them can be a hit
         FixedBitSet acceptedWithHoles = new FixedBitSet(numDocs);
         acceptedWithHoles.set(0, maxAcceptedDoc + 1);
-        assertGraphSearchMaterializesAcceptedOrds(maxAcceptedDoc + 1, numVectors, k);
+        assertGraphSearchMaterializesAcceptedOrds(maxAcceptedDoc + 1, numVectors, k, numDocs);
         TopDocs sparseDocsWithHoles =
             sparseLeaf.searchNearestVectors(
                 "field",
@@ -231,13 +231,50 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
    * that breaks any of the three would otherwise leave that branch untested.
    */
   private static void assertGraphSearchMaterializesAcceptedOrds(
-      int accepted, int numVectors, int k) {
+      int accepted, int numVectors, int k, int maxDoc) {
     int unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, numVectors);
     assertTrue(accepted + " <= " + unfilteredVisit, accepted > unfilteredVisit);
     assertTrue(KnnSearchStrategy.Hnsw.DEFAULT.useFilteredSearch((float) accepted / numVectors));
     assertTrue(
         Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
-            accepted, numVectors, unfilteredVisit));
+            accepted, numVectors, unfilteredVisit, maxDoc));
+  }
+
+  /**
+   * The decision to materialize the accepted ordinals weighs the words that a materialization
+   * walks, which grow with the number of blocks the docs span and not with the number of accepted
+   * docs, against the lookups that the filtered searcher is expected to make.
+   */
+  public void testShouldMaterializeAcceptOrds() {
+    int k = 100;
+    // A 200k doc segment where 10% of the docs have no vector: every filter that reaches the
+    // filtered searcher materializes, whether it accepts 2% or 50% of the docs.
+    int maxDoc = 200_000;
+    int graphSize = 180_000;
+    int unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, graphSize);
+    for (int accepted : new int[] {4_000, 10_000, 40_000, 100_000, 118_000}) {
+      assertTrue(
+          "accepted=" + accepted,
+          Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
+              accepted, graphSize, unfilteredVisit, maxDoc));
+    }
+    // A 10M doc segment: a filter that accepts half of the docs does not, since the searcher is
+    // expected to make a few thousand lookups while a materialization walks a few hundred thousand
+    // words, and a filter that accepts 1% of them does, since the lookups grow with the inverse of
+    // the accepted fraction while the words do not grow at all.
+    maxDoc = 10_000_000;
+    graphSize = 9_000_000;
+    unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, graphSize);
+    assertFalse(
+        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
+            5_000_000, graphSize, unfilteredVisit, maxDoc));
+    assertTrue(
+        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
+            100_000, graphSize, unfilteredVisit, maxDoc));
+    // A filter that accepts a handful of docs spans at most that many blocks
+    assertTrue(
+        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
+            unfilteredVisit + 1, graphSize, unfilteredVisit, maxDoc));
   }
 
   /**
