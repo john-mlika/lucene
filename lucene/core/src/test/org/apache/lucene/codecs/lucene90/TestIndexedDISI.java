@@ -18,6 +18,8 @@ package org.apache.lucene.codecs.lucene90;
 
 import java.io.IOException;
 import java.util.Random;
+import java.util.function.IntSupplier;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -563,7 +565,16 @@ public class TestIndexedDISI extends LuceneTestCase {
             new IndexedDISI(in, 0L, length, jumpTableentryCount, denseRankPower, cardinality);
         BitSetIterator disi2 = new BitSetIterator(set, cardinality);
         int disi2length = set.length();
-        assertIntoBitsetRandomized(disi, disi2, disi2length, step);
+        assertIntoBitsetRandomized(disi, disi::index, disi2, disi2length, step);
+      }
+      // The DocIndexIterator view delegates intoBitSet, and keeps its index in sync
+      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
+        IndexedDISI disi =
+            new IndexedDISI(in, 0L, length, jumpTableentryCount, denseRankPower, cardinality);
+        KnnVectorValues.DocIndexIterator view = IndexedDISI.asDocIndexIterator(disi);
+        BitSetIterator disi2 = new BitSetIterator(set, cardinality);
+        int disi2length = set.length();
+        assertIntoBitsetRandomized(view, view::index, disi2, disi2length, step);
       }
     }
 
@@ -574,6 +585,27 @@ public class TestIndexedDISI extends LuceneTestCase {
         BitSetIterator disi2 = new BitSetIterator(set, cardinality);
         int disi2length = set.length();
         assertDocIDRunEndRandomized(disi, disi2, disi2length, step);
+      }
+      // The DocIndexIterator view delegates docIDRunEnd: it reports the same run ends as the
+      // IndexedDISI itself, where the default implementation would report docID() + 1
+      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT);
+          IndexInput viewIn = dir.openInput("foo", IOContext.DEFAULT)) {
+        IndexedDISI disi =
+            new IndexedDISI(in, 0L, length, jumpTableentryCount, denseRankPower, cardinality);
+        KnnVectorValues.DocIndexIterator view =
+            IndexedDISI.asDocIndexIterator(
+                new IndexedDISI(
+                    viewIn, 0L, length, jumpTableentryCount, denseRankPower, cardinality));
+        for (int target = 0; target < set.length(); target += TestUtil.nextInt(random(), 1, step)) {
+          if (target <= disi.docID()) {
+            continue;
+          }
+          assertEquals(disi.advance(target), view.advance(target));
+          if (disi.docID() == DocIdSetIterator.NO_MORE_DOCS) {
+            break;
+          }
+          assertEquals(disi.docIDRunEnd(), view.docIDRunEnd());
+        }
       }
     }
 
@@ -607,7 +639,12 @@ public class TestIndexedDISI extends LuceneTestCase {
   }
 
   private void assertIntoBitsetRandomized(
-      IndexedDISI disi, BitSetIterator disi2, int disi2length, int step) throws IOException {
+      DocIdSetIterator disi,
+      IntSupplier indexSupplier,
+      BitSetIterator disi2,
+      int disi2length,
+      int step)
+      throws IOException {
     int index = -1;
     FixedBitSet set1 = new FixedBitSet(step);
     FixedBitSet set2 = new FixedBitSet(step);
@@ -632,7 +669,7 @@ public class TestIndexedDISI extends LuceneTestCase {
       }
 
       disi.intoBitSet(upTo, set1, offset);
-      assertEquals(index, disi.index());
+      assertEquals(index, indexSupplier.getAsInt());
       assertEquals(disi2.docID(), disi.docID());
 
       BitSetIterator expected = new BitSetIterator(set2, set2.cardinality());
@@ -647,7 +684,7 @@ public class TestIndexedDISI extends LuceneTestCase {
 
       if (disi2.docID() != DocIdSetIterator.NO_MORE_DOCS) {
         assertEquals(disi2.nextDoc(), disi.nextDoc());
-        assertEquals(++index, disi.index());
+        assertEquals(++index, indexSupplier.getAsInt());
       }
 
       set1.clear();
@@ -656,7 +693,7 @@ public class TestIndexedDISI extends LuceneTestCase {
   }
 
   private void assertDocIDRunEndRandomized(
-      IndexedDISI disi, BitSetIterator disi2, int disi2length, int step) throws IOException {
+      DocIdSetIterator disi, BitSetIterator disi2, int disi2length, int step) throws IOException {
     for (int target = 0; target < disi2length; ) {
       target += TestUtil.nextInt(random(), 0, step);
       if (disi.docID() < target) {
