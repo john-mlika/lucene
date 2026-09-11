@@ -306,9 +306,10 @@ public class TestKnnFloatVectorQuery extends BaseKnnVectorQueryTestCase {
         w.commit();
       }
       try (IndexReader reader = DirectoryReader.open(d)) {
-        assertEquals(1, reader.leaves().size());
         IndexSearcher searcher = newSearcher(reader);
-        LeafReaderContext ctx = reader.leaves().get(0);
+        // The searcher may wrap the reader, so take the leaf that the query will search
+        assertEquals(1, searcher.getIndexReader().leaves().size());
+        LeafReaderContext ctx = searcher.getIndexReader().leaves().get(0);
 
         FixedBitSet expected = new FixedBitSet(ctx.reader().maxDoc());
         Query filter = new TermQuery(new Term("tag", "accept"));
