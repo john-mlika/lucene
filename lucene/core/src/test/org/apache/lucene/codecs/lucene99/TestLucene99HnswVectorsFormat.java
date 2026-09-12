@@ -288,6 +288,20 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
     // walk, while the plain searcher's hundred or so do not.
     assertTrue(OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(153, 1_000, 1_000));
     assertFalse(OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(153, 1_000, 100));
+    // A field of 10k vectors over a 200k doc segment: 2,500 docs per block, which is SPARSE and
+    // costs a short per doc, more than a DENSE block's 1,024 words. The plain searcher's ~900 tests
+    // do not pay for that walk, the filtered searcher's thousands do, and so does the exhaustive
+    // scan's 10k.
+    numVectors = 10_000;
+    unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, numVectors);
+    assertFalse(
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
+            4, numVectors, unfilteredVisit));
+    assertTrue(
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
+            4, numVectors, (long) unfilteredVisit * numVectors / 2_000));
+    assertTrue(
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(4, numVectors, numVectors));
   }
 
   /**
