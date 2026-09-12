@@ -585,33 +585,37 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
    * DENSE block, one short per doc for a SPARSE block. Blocks that hold no set bit of {@code docs}
    * are skipped through the jump table.
    *
-   * <p>The words are those of a {@link FixedBitSet}. The docs of a block of a {@link
-   * SparseFixedBitSet} are first copied into a scratch of one block, a word at a time too, see
-   * {@link SparseFixedBitSet#orRange}. No other kind of bit set is supported.
+   * <p>Docs at or beyond {@code docs.length()} contribute nothing, which relies on the bits of
+   * {@code docs} past its length being clear, as {@link FixedBitSet} keeps them. This iterator must
+   * not have been advanced yet, which is only asserted, and it is exhausted afterwards.
    *
-   * <p>Docs at or beyond {@code docs.length()} are not set in {@code docs}, so they contribute
-   * nothing. This iterator must not have been advanced yet, and it is exhausted afterwards.
-   *
-   * @param docs the docs to look up, a {@link FixedBitSet} or a {@link SparseFixedBitSet}
+   * @param docs the docs to look up
    * @param indices the bit set to set the indices in, which must have at least as many bits as this
    *     iterator has docs
-   * @throws IllegalArgumentException if {@code docs} is neither a {@link FixedBitSet} nor a {@link
-   *     SparseFixedBitSet}
    */
-  public void indicesOf(BitSet docs, FixedBitSet indices) throws IOException {
+  public void indicesOf(FixedBitSet docs, FixedBitSet indices) throws IOException {
+    indicesOf(docs, null, docs.length(), indices);
+  }
+
+  /**
+   * The same as {@link #indicesOf(FixedBitSet, FixedBitSet)} for a sparse bit set of docs, whose
+   * docs are first copied one block at a time into a scratch of one block, a word at a time too,
+   * see {@link SparseFixedBitSet#orRange}.
+   */
+  public void indicesOf(SparseFixedBitSet docs, FixedBitSet indices) throws IOException {
+    indicesOf(new FixedBitSet(BLOCK_SIZE), docs, docs.length(), indices);
+  }
+
+  /**
+   * @param fixedDocs the docs when {@code sparseDocs} is null, else a scratch of one block that the
+   *     docs of each block are copied into
+   * @param maxDoc the length of the docs
+   */
+  private void indicesOf(
+      FixedBitSet fixedDocs, SparseFixedBitSet sparseDocs, int maxDoc, FixedBitSet indices)
+      throws IOException {
     assert doc == -1 : "the iterator has already been advanced to doc " + doc;
-    final FixedBitSet fixedDocs;
-    final SparseFixedBitSet sparseDocs;
-    if (docs instanceof FixedBitSet fixedBitSet) {
-      fixedDocs = fixedBitSet;
-      sparseDocs = null;
-    } else if (docs instanceof SparseFixedBitSet sparseFixedBitSet) {
-      fixedDocs = new FixedBitSet(BLOCK_SIZE);
-      sparseDocs = sparseFixedBitSet;
-    } else {
-      throw new IllegalArgumentException("unsupported bit set: " + docs.getClass().getName());
-    }
-    final int maxDoc = docs.length();
+    final BitSet docs = sparseDocs == null ? fixedDocs : sparseDocs;
     int target = maxDoc == 0 ? DocIdSetIterator.NO_MORE_DOCS : docs.nextSetBit(0);
     while (target != DocIdSetIterator.NO_MORE_DOCS) {
       final int targetBlock = target & 0xFFFF0000;
@@ -632,7 +636,8 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       if (sparseDocs == null) {
         docsOffset = 0;
       } else {
-        // The docs of this block, a word at a time, at the start of the scratch
+        // The docs of this block, a word at a time, at the start of the scratch, which is cleared
+        // whole: the last word of a block that ends before the end of the scratch is read whole too
         docsOffset = block;
         fixedDocs.clear();
         SparseFixedBitSet.orRange(
@@ -879,8 +884,11 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
             final int shift = index & 0x3F;
             indexBits[indexWord] |= packed << shift;
             if (shift != 0) {
+              // The bits that spill over into the next word: when there are any, an accepted doc
+              // has an index in that word, so it is in range
               final long high = packed >>> -shift;
               if (high != 0L) {
+                assert indexWord + 1 < indexBits.length;
                 indexBits[indexWord + 1] |= high;
               }
             }

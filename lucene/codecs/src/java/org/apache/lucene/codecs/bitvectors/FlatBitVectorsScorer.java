@@ -22,6 +22,7 @@ import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.HasKnnVectorValues;
@@ -100,6 +101,11 @@ public class FlatBitVectorsScorer implements FlatVectorsScorer {
     @Override
     public Bits getAcceptOrds(Bits acceptDocs) {
       return vectorValues.getAcceptOrds(acceptDocs);
+    }
+
+    @Override
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return vectorValues.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override

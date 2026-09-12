@@ -373,16 +373,30 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
     if (unfilteredVisit >= filteredDocCount || graphSize == 0) {
       doHnsw = false;
     }
-    if (doHnsw
-        && HnswGraphSearcher.useFilteredSearch(
-            knnCollector, acceptedOrds, filteredDocCount, graphSize, fieldEntry.M())
-        && shouldMaterializeAcceptOrds(
-            filteredDocCount, graphSize, unfilteredVisit, accepted.length())) {
-      // The same bits, only answered in constant time, when the values can materialize them
-      BitSet materialized = scorer.materializeAcceptOrds(accepted);
-      if (materialized != null) {
-        acceptedOrds = materialized;
-      }
+    // How many ordinals the search is expected to test against the accepted ordinals, which is
+    // what materializing them into a bit set saves: the values weigh that against their own cost of
+    // a materialization and answer with a bit set only when it pays. The exhaustive scan tests
+    // every
+    // ordinal unless it can enumerate the accepted ones. A searcher optimized for filtering tests
+    // the accepted ordinals of every neighbor of the nodes it pops and only counts as visited the
+    // ones that pass, so it runs about unfilteredVisit * graphSize / filteredDocCount tests, the
+    // estimate that FilteredHnswGraphSearcher itself uses to size its visited bit set, capped by
+    // the
+    // graph size since it tests a node at most once. The plain searcher tests the nodes it scores.
+    final long tests;
+    if (doHnsw == false) {
+      tests = numVectors;
+    } else if (HnswGraphSearcher.useFilteredSearch(
+        knnCollector, acceptedOrds, filteredDocCount, graphSize, fieldEntry.M())) {
+      tests = Math.min((long) unfilteredVisit * graphSize / filteredDocCount, graphSize);
+    } else {
+      tests = unfilteredVisit;
+    }
+    // Accept docs that are backed by live docs alone are not a bit set and are never materialized
+    BitSet materialized = accepted == null ? null : scorer.materializeAcceptOrds(accepted, tests);
+    if (materialized != null) {
+      // The same bits, only answered in constant time
+      acceptedOrds = materialized;
     }
     if (doHnsw) {
       HnswGraphSearcher.search(
@@ -390,77 +404,9 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
     } else {
       // if k is larger than the number of vectors we expect to visit in an HNSW search,
       // we can just score all the accepted vectors and collect them: exactly the accepted ordinals
-      // when the values can materialize them, every ordinal tested against them otherwise
-      BitSet materialized = accepted == null ? null : scorer.materializeAcceptOrds(accepted);
-      ExhaustiveVectorSearcher.search(
-          scorer, knnCollector, materialized != null ? materialized : acceptedOrds);
+      // when they were materialized, every ordinal tested against them otherwise
+      ExhaustiveVectorSearcher.search(scorer, knnCollector, acceptedOrds, materialized);
     }
-  }
-
-  /**
-   * How many docs one block of the docs that have a vector covers: the blocks of {@link
-   * org.apache.lucene.codecs.lucene90.IndexedDISI}, which materializing the accepted ordinals walks
-   * a word at a time.
-   */
-  static final int DOCS_PER_BLOCK = 1 << 16;
-
-  /**
-   * How many word operations of the materialization one ordinal to doc lookup of the lazy accepted
-   * ordinals costs. A lookup reads the off-heap ordinal to doc mapping through a {@code
-   * DirectMonotonicReader}, which is two on-heap array reads, a bounds-checked read of the packed
-   * off-heap values and a multiply-add, and then reads the accepted docs: about thirty instructions
-   * with three dependent loads. A word of the materialization is two loads, an AND, a POPCNT and an
-   * ADD, plus a PEXT and two shifted ORs when the word holds an accepted doc, and consecutive words
-   * are independent: about four instructions with no dependent load. That puts a lookup at about
-   * eight words.
-   *
-   * <p>This is an instruction count rather than a fitted value. It assumes that the JIT compiles
-   * {@code Long#compress} to PEXT, which it does on x86 with BMI2. Where it does not, a word that
-   * holds an accepted doc costs about as much as a lookup, and materializing pays off later than
-   * this value says.
-   */
-  static final int WORD_OPS_PER_LOOKUP = 8;
-
-  /**
-   * Whether to materialize the accepted ordinals into a bit set before searching the graph with a
-   * searcher optimized for filtering, rather than mapping every tested ordinal to its doc through
-   * the off-heap ordinal to doc mapping.
-   *
-   * <p>Such a searcher tests the accepted ordinals of every neighbor of the nodes that it pops, and
-   * only counts as visited the neighbors that pass and get scored, so it runs about {@code
-   * unfilteredVisit * graphSize / filteredDocCount} tests, which is the estimate that {@code
-   * FilteredHnswGraphSearcher} itself uses to size its visited bit set. It tests a node at most
-   * once, so the graph size caps that count. The count does not depend on the number of connections
-   * per node to first order: a larger fan-out makes every pop more expensive, it does not change
-   * how many nodes have to be tested before enough of them pass. The estimate is rough: every
-   * scored node is a test that passed, so the tests are the scored nodes divided by the fraction of
-   * the docs that the filter accepts, and the searcher scores fewer nodes than {@code
-   * unfilteredVisit} for a very selective filter but more for a broad one, since it also explores
-   * the neighbors of the nodes that fail the filter. On a 200k doc index of random 128-dim vectors
-   * with maxConn=16 and k=100, it runs 0.6 times the estimate for a filter that accepts 2% of the
-   * docs and 3 to 5 times the estimate for one that accepts a fifth to a half of them.
-   *
-   * <p>Materializing walks the accepted docs a word at a time over the blocks of the docs that have
-   * a vector, see {@code IndexedDISI#indicesOf}: {@code DOCS_PER_BLOCK / 64} words for every block
-   * that holds an accepted doc, plus a bit set of {@code graphSize} bits to allocate and zero. That
-   * cost depends on how many blocks the accepted docs span and not on how many there are, so it is
-   * at most about {@code maxDoc / 64} words for any filter, and it saves one lookup per test. Both
-   * sides are counted in word operations. The accepted docs are walked that way whether they are a
-   * {@code FixedBitSet} or a {@code SparseFixedBitSet}, which is what the accept docs that Lucene
-   * builds are; any other bits are leap frogged a doc at a time instead.
-   *
-   * @param filteredDocCount the number of docs that pass the filter
-   * @param graphSize the number of nodes in the graph
-   * @param unfilteredVisit the number of nodes that an unfiltered search is expected to visit
-   * @param maxDoc the number of docs in the segment
-   */
-  static boolean shouldMaterializeAcceptOrds(
-      int filteredDocCount, int graphSize, int unfilteredVisit, int maxDoc) {
-    assert filteredDocCount > 0 && filteredDocCount <= graphSize && graphSize <= maxDoc;
-    long tests = Math.min((long) unfilteredVisit * graphSize / filteredDocCount, graphSize);
-    long blocks = Math.min(filteredDocCount, ((long) maxDoc + DOCS_PER_BLOCK - 1) / DOCS_PER_BLOCK);
-    long words = blocks * (DOCS_PER_BLOCK / Long.SIZE) + graphSize / Long.SIZE;
-    return tests * WORD_OPS_PER_LOOKUP >= words;
   }
 
   @Override

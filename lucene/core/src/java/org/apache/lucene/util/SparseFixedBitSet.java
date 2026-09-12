@@ -866,7 +866,9 @@ public class SparseFixedBitSet extends BitSet {
         }
 
         final int destLong = i64 + destLongDelta;
-        assert destLong < destBits.length;
+        // The first long of the range may map to the long before dest's first, and then only the
+        // bits it shifts into destLong + 1 can be set
+        assert destLong >= -1 && destLong < destBits.length;
         final long lowBits = word << shift;
         if (destLong >= 0) {
           destBits[destLong] |= lowBits;

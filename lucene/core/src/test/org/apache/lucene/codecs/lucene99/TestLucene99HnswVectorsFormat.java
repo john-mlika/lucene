@@ -31,6 +31,7 @@ import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.FilterCodec;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
+import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.KnnByteVectorField;
@@ -236,46 +237,57 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
     int unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, numVectors);
     assertTrue(accepted + " <= " + unfilteredVisit, accepted > unfilteredVisit);
     assertTrue(KnnSearchStrategy.Hnsw.DEFAULT.useFilteredSearch((float) accepted / numVectors));
+    long tests = Math.min((long) unfilteredVisit * numVectors / accepted, numVectors);
     assertTrue(
-        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
-            accepted, numVectors, unfilteredVisit, maxDoc));
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
+            (maxDoc + (1 << 16) - 1) >>> 16, numVectors, tests));
   }
 
   /**
    * The decision to materialize the accepted ordinals weighs the words that a materialization
-   * walks, which grow with the number of blocks the docs span and not with the number of accepted
-   * docs, against the lookups that the filtered searcher is expected to make.
+   * walks, which grow with the number of blocks the docs that have a vector span and not with the
+   * number of docs a filter accepts, against the lookups it saves, one per ordinal the search
+   * tests.
    */
   public void testShouldMaterializeAcceptOrds() {
     int k = 100;
-    // A 200k doc segment where 10% of the docs have no vector: every filter that reaches the
-    // filtered searcher materializes, whether it accepts 2% or 50% of the docs.
-    int maxDoc = 200_000;
-    int graphSize = 180_000;
-    int unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, graphSize);
+    // A 200k doc segment where 10% of the docs have no vector, 4 blocks: every filter that reaches
+    // the filtered searcher materializes, whether it accepts 2% or 50% of the docs, since the
+    // searcher tests more than 864 ordinals for any of them.
+    int numVectors = 180_000;
+    int unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, numVectors);
     for (int accepted : new int[] {4_000, 10_000, 40_000, 100_000, 118_000}) {
+      long tests = Math.min((long) unfilteredVisit * numVectors / accepted, numVectors);
       assertTrue(
           "accepted=" + accepted,
-          Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
-              accepted, graphSize, unfilteredVisit, maxDoc));
+          OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(4, numVectors, tests));
     }
-    // A 10M doc segment: a filter that accepts half of the docs does not, since the searcher is
-    // expected to make a few thousand lookups while a materialization walks a few hundred thousand
-    // words, and a filter that accepts 1% of them does, since the lookups grow with the inverse of
-    // the accepted fraction while the words do not grow at all.
-    maxDoc = 10_000_000;
-    graphSize = 9_000_000;
-    unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, graphSize);
+    // The plain searcher and the exhaustive scan on the same segment: the scan tests every ordinal
+    assertTrue(
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
+            4, numVectors, unfilteredVisit));
+    assertTrue(
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(4, numVectors, numVectors));
+    // A 10M doc segment with 9M vectors, 153 blocks of 1,024 words: a filter that accepts half of
+    // the docs does not materialize, since the searcher is expected to make a few thousand lookups
+    // while a materialization walks a few hundred thousand words, and a filter that accepts 1% of
+    // them does, since the lookups grow with the inverse of the accepted fraction while the words
+    // do not grow at all. The exhaustive scan of that field always does: 9M lookups.
+    numVectors = 9_000_000;
+    unfilteredVisit = HnswGraphSearcher.expectedVisitedNodes(k, numVectors);
     assertFalse(
-        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
-            5_000_000, graphSize, unfilteredVisit, maxDoc));
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
+            153, numVectors, (long) unfilteredVisit * numVectors / 5_000_000));
     assertTrue(
-        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
-            100_000, graphSize, unfilteredVisit, maxDoc));
-    // A filter that accepts a handful of docs spans at most that many blocks
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
+            153, numVectors, (long) unfilteredVisit * numVectors / 100_000));
     assertTrue(
-        Lucene99HnswVectorsReader.shouldMaterializeAcceptOrds(
-            unfilteredVisit + 1, graphSize, unfilteredVisit, maxDoc));
+        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(153, numVectors, numVectors));
+    // A field of 1,000 vectors spread over a 10M doc segment: its blocks are sparse and cost a
+    // short per doc, about 7 words each, so even the exhaustive scan's 1,000 lookups pay for the
+    // walk, while the plain searcher's hundred or so do not.
+    assertTrue(OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(153, 1_000, 1_000));
+    assertFalse(OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(153, 1_000, 100));
   }
 
   /**
@@ -625,7 +637,7 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
             }
           }
           Bits lazy = sparseValues.getAcceptOrds(acceptDocs);
-          BitSet materialized = sparseValues.materializeAcceptOrds(acceptDocs);
+          BitSet materialized = sparseValues.materializeAcceptOrds(acceptDocs, Long.MAX_VALUE);
           assertNotNull(materialized);
           assertEquals(sparseValues.size(), materialized.length());
           DocIdSetIterator acceptedOrds =
@@ -648,15 +660,15 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
           }
           assertEquals(accepted, enumerated);
         }
-        assertNull(sparseValues.materializeAcceptOrds(null));
+        assertNull(sparseValues.materializeAcceptOrds(null, Long.MAX_VALUE));
 
         // A dense field has nothing to materialize: its ordinals are its docs
         FloatVectorValues denseValues =
             denseReader.leaves().get(0).reader().getFloatVectorValues("field");
         FixedBitSet acceptDocs = new FixedBitSet(denseValues.size());
         acceptDocs.set(0, denseValues.size());
-        assertSame(acceptDocs, denseValues.materializeAcceptOrds(acceptDocs));
-        assertNull(denseValues.materializeAcceptOrds(null));
+        assertSame(acceptDocs, denseValues.materializeAcceptOrds(acceptDocs, Long.MAX_VALUE));
+        assertNull(denseValues.materializeAcceptOrds(null, Long.MAX_VALUE));
       }
     }
   }
@@ -752,8 +764,9 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
                 }
               };
           Bits lazy = sparseValues.getAcceptOrds(acceptDocs);
-          BitSet materialized = sparseValues.materializeAcceptOrds(acceptDocs);
-          BitSet sparseMaterialized = sparseValues.materializeAcceptOrds(sparseAcceptDocs);
+          BitSet materialized = sparseValues.materializeAcceptOrds(acceptDocs, Long.MAX_VALUE);
+          BitSet sparseMaterialized =
+              sparseValues.materializeAcceptOrds(sparseAcceptDocs, Long.MAX_VALUE);
           assertNotNull(materialized);
           assertNotNull(sparseMaterialized);
           assertNotSame(lazy, materialized);
@@ -767,20 +780,20 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
           }
           assertEquals(materialized, sparseMaterialized);
           // Accepted docs that are not a bit set are not materialized: the lazy view answers
-          assertNull(sparseValues.materializeAcceptOrds(plainAcceptDocs));
+          assertNull(sparseValues.materializeAcceptOrds(plainAcceptDocs, Long.MAX_VALUE));
           Bits plainLazy = sparseValues.getAcceptOrds(plainAcceptDocs);
           for (int ord = 0; ord < sparseValues.size(); ord++) {
             assertEquals("ord=" + ord, lazy.get(ord), plainLazy.get(ord));
           }
         }
-        assertNull(sparseValues.materializeAcceptOrds(null));
+        assertNull(sparseValues.materializeAcceptOrds(null, Long.MAX_VALUE));
 
         // A dense field has nothing to materialize: its ordinals are its docs
         FloatVectorValues denseValues =
             denseReader.leaves().get(0).reader().getFloatVectorValues("field");
         FixedBitSet acceptDocs = new FixedBitSet(denseValues.size());
         acceptDocs.set(0, denseValues.size());
-        assertSame(acceptDocs, denseValues.materializeAcceptOrds(acceptDocs));
+        assertSame(acceptDocs, denseValues.materializeAcceptOrds(acceptDocs, Long.MAX_VALUE));
         Bits plainAcceptDocs =
             new Bits() {
               @Override
@@ -793,7 +806,7 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
                 return acceptDocs.length();
               }
             };
-        assertNull(denseValues.materializeAcceptOrds(plainAcceptDocs));
+        assertNull(denseValues.materializeAcceptOrds(plainAcceptDocs, Long.MAX_VALUE));
         assertSame(plainAcceptDocs, denseValues.getAcceptOrds(plainAcceptDocs));
       }
     }

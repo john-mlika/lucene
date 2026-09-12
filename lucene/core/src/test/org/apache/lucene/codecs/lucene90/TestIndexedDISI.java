@@ -606,84 +606,6 @@ public class TestIndexedDISI extends LuceneTestCase {
     return new BitSet[] {docs, sparse};
   }
 
-  public void testIndicesOfRejectsOtherBitSets() throws IOException {
-    FixedBitSet set = new FixedBitSet(100);
-    set.set(0, 100);
-    try (Directory dir = newDirectory()) {
-      long length;
-      int jumpTableEntryCount;
-      try (IndexOutput out = dir.createOutput("foo", IOContext.DEFAULT)) {
-        jumpTableEntryCount =
-            IndexedDISI.writeBitSet(
-                new BitSetIterator(set, 100), out, IndexedDISI.DEFAULT_DENSE_RANK_POWER);
-        length = out.getFilePointer();
-      }
-      try (IndexInput in = dir.openInput("foo", IOContext.DEFAULT)) {
-        IndexedDISI disi =
-            new IndexedDISI(
-                in, 0L, length, jumpTableEntryCount, IndexedDISI.DEFAULT_DENSE_RANK_POWER, 100);
-        BitSet other =
-            new BitSet() {
-              @Override
-              public void set(int i) {}
-
-              @Override
-              public boolean getAndSet(int i) {
-                return false;
-              }
-
-              @Override
-              public void clear(int i) {}
-
-              @Override
-              public void clear(int startIndex, int endIndex) {}
-
-              @Override
-              public int cardinality() {
-                return 0;
-              }
-
-              @Override
-              public int approximateCardinality() {
-                return 0;
-              }
-
-              @Override
-              public int prevSetBit(int index) {
-                return -1;
-              }
-
-              @Override
-              public int nextSetBit(int start, int upperBound) {
-                return DocIdSetIterator.NO_MORE_DOCS;
-              }
-
-              @Override
-              public int nextClearBit(int start, int upperBound) {
-                return start;
-              }
-
-              @Override
-              public long ramBytesUsed() {
-                return 0;
-              }
-
-              @Override
-              public boolean get(int index) {
-                return false;
-              }
-
-              @Override
-              public int length() {
-                return 100;
-              }
-            };
-        expectThrows(
-            IllegalArgumentException.class, () -> disi.indicesOf(other, new FixedBitSet(100)));
-      }
-    }
-  }
-
   /**
    * Random docs to look up in {@code set}: a random density, over a length that may be shorter than
    * the set, so that docs of the set beyond it are not looked up, or longer, so that docs beyond
@@ -791,7 +713,11 @@ public class TestIndexedDISI extends LuceneTestCase {
     assertEquals(cardinality, index);
 
     FixedBitSet actual = new FixedBitSet(cardinality);
-    disi.indicesOf(docs, actual);
+    if (docs instanceof FixedBitSet fixedDocs) {
+      disi.indicesOf(fixedDocs, actual);
+    } else {
+      disi.indicesOf((SparseFixedBitSet) docs, actual);
+    }
     assertEquals(
         "cardinality of the indices of " + docs.cardinality() + " docs over " + docs.length(),
         expected.cardinality(),

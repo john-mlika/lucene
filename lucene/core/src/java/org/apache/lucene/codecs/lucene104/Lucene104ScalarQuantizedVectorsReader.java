@@ -687,8 +687,8 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
-      return rawVectorValues.materializeAcceptOrds(acceptDocs);
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return rawVectorValues.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override
@@ -754,8 +754,8 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
-      return rawVectorValues.materializeAcceptOrds(acceptDocs);
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return rawVectorValues.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override
