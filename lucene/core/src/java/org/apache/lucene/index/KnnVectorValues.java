@@ -21,9 +21,7 @@ import org.apache.lucene.document.KnnByteVectorField;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.BitSet;
-import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.FixedBitSet;
 
 /**
  * This class abstracts addressing of document vector values indexed as {@link KnnFloatVectorField}
@@ -79,8 +77,8 @@ public abstract class KnnVectorValues {
    *
    * <p>The bits are indexed by ordinal rather than by doc. An implementation that returns {@code
    * acceptDocs} itself is asserting that its ordinals are its docs, which is the invariant that
-   * {@link #ordToDoc(int)} returns the argument, and that dense values rely on to enumerate their
-   * accepted ordinals in {@link #acceptedOrdsIterator(Bits, DocIdSetIterator)}.
+   * {@link #ordToDoc(int)} returns the argument, and that dense values rely on in {@link
+   * #materializeAcceptOrds(Bits)}.
    */
   public Bits getAcceptOrds(Bits acceptDocs) {
     // FIXME: change default to return acceptDocs and provide this impl
@@ -102,100 +100,29 @@ public abstract class KnnVectorValues {
   }
 
   /**
-   * Returns a Bits accepting docs accepted by the argument and having a vector value, like {@link
-   * #getAcceptOrds(Bits)}, materialized up-front rather than mapping every tested ordinal to its
-   * doc.
+   * Returns the accepted ordinals of {@link #getAcceptOrds(Bits)} materialized into a bit set, or
+   * {@code null} when they cannot be materialized and a caller has to test them one at a time
+   * through the lazy view instead.
    *
-   * <p>Implementations that map ordinals to docs through an off-heap structure answer the same
-   * question more cheaply by walking {@code acceptDocsIterator} and the docs that have a vector
-   * once, as long as the caller tests more ordinals than the filter accepts docs. The default
-   * implementation ignores the iterator and returns the lazy view, which is what dense values want:
-   * their ordinals are their docs, so there is nothing to materialize.
+   * <p>A bit set answers the same question as the lazy view in constant time, and it can be
+   * enumerated, so a caller that would rather score exactly the accepted vectors than test every
+   * ordinal can do so. Materializing costs a pass over the accepted docs; whether that pass is
+   * worth the tests it saves is the caller's decision, this method only answers.
    *
-   * <p>An implementation that materializes them returns a {@link BitSet}, so that a caller that
-   * would rather enumerate the accepted ordinals than test them one at a time can do so through
-   * {@link #acceptedOrdsIterator(Bits, DocIdSetIterator)}.
+   * <p>The default implementation returns {@code null}. Values whose ordinals are their docs return
+   * {@code acceptDocs} itself when it is a {@link BitSet}, since the accepted docs are then the
+   * accepted ordinals. Values that map ordinals to docs through an off-heap structure answer with
+   * the ordinals of the accepted docs, computed a word at a time when {@code acceptDocs} is a
+   * {@link org.apache.lucene.util.FixedBitSet} or a {@link
+   * org.apache.lucene.util.SparseFixedBitSet}, which is what {@link
+   * org.apache.lucene.search.AcceptDocs} builds.
    *
-   * @param acceptDocs the accepted docs, or {@code null} if all docs are accepted
-   * @param acceptDocsIterator an iterator over the same docs as {@code acceptDocs}, which
-   *     implementations are free to consume entirely
+   * @param acceptDocs the accepted docs, or {@code null} if all docs are accepted, in which case
+   *     there is nothing to materialize
+   * @return the accepted ordinals as a bit set of {@link #size()} bits, or {@code null}
    */
-  public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-      throws IOException {
-    return getAcceptOrds(acceptDocs);
-  }
-
-  /**
-   * Returns an iterator over the ordinals of the vectors whose doc is accepted, in increasing
-   * order, or {@code null} when they cannot be enumerated and a caller has to test every ordinal
-   * against {@link #getAcceptOrds(Bits)} instead.
-   *
-   * <p>The iterator visits exactly the ordinals that {@link #getAcceptOrds(Bits)} accepts, so a
-   * caller that scores all of them scores every accepted vector once and nothing else.
-   *
-   * <p>The default implementation materializes them through {@link #getAcceptOrds(Bits,
-   * DocIdSetIterator)}, which answers with a {@link BitSet} in the implementations that map
-   * ordinals to docs through an off-heap structure, and with the lazy view in the ones that do not,
-   * which cannot be enumerated. Dense values override this to hand back the accepted docs
-   * themselves, since their ordinals are their docs.
-   *
-   * @param acceptDocs the accepted docs, or {@code null} if all docs are accepted
-   * @param acceptDocsIterator an iterator over the same docs as {@code acceptDocs}, which
-   *     implementations are free to consume entirely
-   */
-  public DocIdSetIterator acceptedOrdsIterator(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-      throws IOException {
-    if (acceptDocs == null) {
-      return null;
-    }
-    if (getAcceptOrds(acceptDocs, acceptDocsIterator) instanceof BitSet acceptedOrds) {
-      assert acceptedOrds.length() == size()
-          : "accepted ordinals of " + acceptedOrds.length() + " bits for " + size() + " vectors";
-      return new BitSetIterator(acceptedOrds, acceptedOrds.approximateCardinality());
-    }
+  public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
     return null;
-  }
-
-  /**
-   * Materializes into a bit set the ordinals of the vectors whose doc is accepted, by leap frogging
-   * the accepted docs with the docs that have a vector.
-   *
-   * <p>Both iterators must be positioned before their first doc, and {@code vectors} must keep
-   * {@link DocIndexIterator#index()} in sync with its doc after an {@link
-   * DocIndexIterator#advance(int)}, which is the case for iterators over a disk-based doc id set
-   * but not for {@link #fromDISI}, whose ordinal only moves on {@link DocIndexIterator#nextDoc()}.
-   * The assertions below check that invariant.
-   *
-   * <p>The bit set is returned rather than a read-only view of it, so that a caller that would
-   * rather enumerate the accepted ordinals than test them one at a time can do so. Nothing else
-   * holds a reference to it.
-   *
-   * @param acceptDocsIterator an iterator over the accepted docs, which this method consumes
-   * @param vectors an iterator over the docs that have a vector, which this method consumes
-   */
-  protected final FixedBitSet materializeAcceptOrds(
-      DocIdSetIterator acceptDocsIterator, DocIndexIterator vectors) throws IOException {
-    FixedBitSet acceptedOrds = new FixedBitSet(size());
-    int acceptedDoc = acceptDocsIterator.nextDoc();
-    int vectorDoc = vectors.nextDoc();
-    int previousOrd = -1;
-    while (acceptedDoc != DocIdSetIterator.NO_MORE_DOCS
-        && vectorDoc != DocIdSetIterator.NO_MORE_DOCS) {
-      if (vectorDoc < acceptedDoc) {
-        vectorDoc = vectors.advance(acceptedDoc);
-      } else if (vectorDoc == acceptedDoc) {
-        assert vectors.docID() == acceptedDoc;
-        int ord = vectors.index();
-        assert ord > previousOrd
-            : "ordinals must increase with docs: " + ord + " <= " + previousOrd;
-        previousOrd = ord;
-        acceptedOrds.set(ord);
-        acceptedDoc = acceptDocsIterator.nextDoc();
-      } else {
-        acceptedDoc = acceptDocsIterator.advance(vectorDoc);
-      }
-    }
-    return acceptedOrds;
   }
 
   /** Create an iterator for this instance. */

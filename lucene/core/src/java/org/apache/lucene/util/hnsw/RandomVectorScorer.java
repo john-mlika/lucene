@@ -19,7 +19,7 @@ package org.apache.lucene.util.hnsw;
 
 import java.io.IOException;
 import org.apache.lucene.index.KnnVectorValues;
-import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 
 /**
@@ -80,31 +80,14 @@ public interface RandomVectorScorer {
   }
 
   /**
-   * Returns the {@link Bits} representing the accepted ordinals, materialized up-front rather than
-   * computed on every test when the values that this scorer reads from can do it more cheaply. By
-   * default, this is {@link #getAcceptOrds(Bits)}.
+   * Returns the accepted ordinals materialized into a bit set, or {@code null} when the values this
+   * scorer reads from cannot do it, see {@link KnnVectorValues#materializeAcceptOrds(Bits)}. By
+   * default they cannot, since only the values know how their ordinals map to their docs.
    *
    * @param acceptDocs the accept docs
-   * @param acceptDocsIterator an iterator over the same docs as {@code acceptDocs}
-   * @return the accept ords
+   * @return the accepted ordinals as a bit set, or {@code null}
    */
-  default Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-      throws IOException {
-    return getAcceptOrds(acceptDocs);
-  }
-
-  /**
-   * Returns an iterator over the ordinals that {@link #getAcceptOrds(Bits)} accepts, in increasing
-   * order, or {@code null} when they cannot be enumerated and every ordinal has to be tested
-   * instead. By default they cannot be enumerated, since only the values this scorer reads from
-   * know how their ordinals map to their docs.
-   *
-   * @param acceptDocs the accept docs
-   * @param acceptDocsIterator an iterator over the same docs as {@code acceptDocs}
-   * @return the accepted ordinals in increasing order, or {@code null}
-   */
-  default DocIdSetIterator acceptedOrdsIterator(
-      Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
+  default BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
     return null;
   }
 
@@ -137,15 +120,8 @@ public interface RandomVectorScorer {
     }
 
     @Override
-    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-        throws IOException {
-      return values.getAcceptOrds(acceptDocs, acceptDocsIterator);
-    }
-
-    @Override
-    public DocIdSetIterator acceptedOrdsIterator(
-        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
-      return values.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      return values.materializeAcceptOrds(acceptDocs);
     }
 
     @Override

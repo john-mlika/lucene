@@ -215,7 +215,7 @@ public class OrdToDocDISIReaderConfiguration {
    * @return a bit set of {@code size} bits over the ordinals, or {@code null}
    * @throws IOException thrown when reading data fails
    */
-  public FixedBitSet getAcceptOrds(IndexInput dataIn, Bits acceptDocs) throws IOException {
+  public FixedBitSet materializeAcceptOrds(IndexInput dataIn, Bits acceptDocs) throws IOException {
     if (acceptDocs instanceof FixedBitSet || acceptDocs instanceof SparseFixedBitSet) {
       FixedBitSet acceptOrds = new FixedBitSet(size);
       getIndexedDISI(dataIn).indicesOf((BitSet) acceptDocs, acceptOrds);

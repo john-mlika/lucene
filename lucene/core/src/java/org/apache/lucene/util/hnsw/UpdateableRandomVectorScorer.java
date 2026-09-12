@@ -18,6 +18,7 @@ package org.apache.lucene.util.hnsw;
 
 import java.io.IOException;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 
 /**
@@ -63,6 +64,11 @@ public interface UpdateableRandomVectorScorer extends RandomVectorScorer {
     @Override
     public Bits getAcceptOrds(Bits acceptDocs) {
       return values.getAcceptOrds(acceptDocs);
+    }
+
+    @Override
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      return values.materializeAcceptOrds(acceptDocs);
     }
 
     @Override
