@@ -55,6 +55,7 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.BaseKnnVectorsFormatTestCase;
 import org.apache.lucene.tests.util.TestUtil;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
@@ -595,11 +596,12 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
   }
 
   /**
-   * The ordinals that a field enumerates as accepted are exactly the ones it accepts one at a time,
-   * in increasing order, and a field where every doc has a vector enumerates the accepted docs
-   * themselves.
+   * The bit set that a sparse field materializes enumerates exactly the ordinals that its lazy view
+   * accepts, in increasing order, so that a scan over it scores every accepted vector once and
+   * nothing else. A dense field hands the accepted docs back as the accepted ordinals, which are
+   * the same thing there.
    */
-  public void testAcceptedOrdsIterator() throws IOException {
+  public void testMaterializedAcceptOrdsEnumerate() throws IOException {
     int numDocs = 1000;
     int dimension = 4;
     float[][] vectors = new float[numDocs][];
@@ -623,10 +625,11 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
             }
           }
           Bits lazy = sparseValues.getAcceptOrds(acceptDocs);
+          BitSet materialized = sparseValues.materializeAcceptOrds(acceptDocs);
+          assertNotNull(materialized);
+          assertEquals(sparseValues.size(), materialized.length());
           DocIdSetIterator acceptedOrds =
-              sparseValues.acceptedOrdsIterator(
-                  acceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality()));
-          assertNotNull(acceptedOrds);
+              new BitSetIterator(materialized, materialized.approximateCardinality());
           int enumerated = 0;
           int previousOrd = -1;
           for (int ord = acceptedOrds.nextDoc();
@@ -645,18 +648,15 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
           }
           assertEquals(accepted, enumerated);
         }
-        assertNull(sparseValues.acceptedOrdsIterator(null, DocIdSetIterator.all(numDocs)));
+        assertNull(sparseValues.materializeAcceptOrds(null));
 
-        // A dense field has nothing to enumerate: its ordinals are its docs
+        // A dense field has nothing to materialize: its ordinals are its docs
         FloatVectorValues denseValues =
             denseReader.leaves().get(0).reader().getFloatVectorValues("field");
         FixedBitSet acceptDocs = new FixedBitSet(denseValues.size());
         acceptDocs.set(0, denseValues.size());
-        BitSetIterator acceptDocsIterator =
-            new BitSetIterator(acceptDocs, acceptDocs.cardinality());
-        assertSame(
-            acceptDocsIterator, denseValues.acceptedOrdsIterator(acceptDocs, acceptDocsIterator));
-        assertNull(denseValues.acceptedOrdsIterator(null, acceptDocsIterator));
+        assertSame(acceptDocs, denseValues.materializeAcceptOrds(acceptDocs));
+        assertNull(denseValues.materializeAcceptOrds(null));
       }
     }
   }
@@ -711,8 +711,8 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
   /**
    * The accepted ordinals that a sparse field materializes must be the same bits as the ones it
    * computes lazily, whether or not the accepted docs have a vector, and whether they are
-   * materialized a word at a time from a {@link FixedBitSet} or a doc at a time from any other
-   * accepted docs.
+   * materialized a word at a time from a {@link FixedBitSet} or from a {@link SparseFixedBitSet}.
+   * Accepted docs that are neither cannot be materialized, and the lazy view answers for them.
    */
   public void testMaterializedAcceptOrds() throws IOException {
     int numDocs = 1000;
@@ -739,7 +739,6 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
               sparseAcceptDocs.set(doc);
             }
           }
-          // Accept docs that are not a bit set are leap frogged a doc at a time
           Bits plainAcceptDocs =
               new Bits() {
                 @Override
@@ -753,42 +752,49 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
                 }
               };
           Bits lazy = sparseValues.getAcceptOrds(acceptDocs);
-          Bits materialized =
-              sparseValues.getAcceptOrds(
-                  acceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality()));
-          Bits sparseMaterialized =
-              sparseValues.getAcceptOrds(
-                  sparseAcceptDocs,
-                  new BitSetIterator(sparseAcceptDocs, sparseAcceptDocs.cardinality()));
-          Bits leapFrogged =
-              sparseValues.getAcceptOrds(
-                  plainAcceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality()));
+          BitSet materialized = sparseValues.materializeAcceptOrds(acceptDocs);
+          BitSet sparseMaterialized = sparseValues.materializeAcceptOrds(sparseAcceptDocs);
+          assertNotNull(materialized);
+          assertNotNull(sparseMaterialized);
           assertNotSame(lazy, materialized);
           assertNotSame(lazy, sparseMaterialized);
-          assertNotSame(lazy, leapFrogged);
           assertEquals(sparseValues.size(), lazy.length());
           assertEquals(sparseValues.size(), materialized.length());
           assertEquals(sparseValues.size(), sparseMaterialized.length());
-          assertEquals(sparseValues.size(), leapFrogged.length());
           for (int ord = 0; ord < sparseValues.size(); ord++) {
             assertEquals("ord=" + ord, lazy.get(ord), materialized.get(ord));
             assertEquals("ord=" + ord, lazy.get(ord), sparseMaterialized.get(ord));
-            assertEquals("ord=" + ord, lazy.get(ord), leapFrogged.get(ord));
           }
           assertEquals(materialized, sparseMaterialized);
-          assertEquals(materialized, leapFrogged);
+          // Accepted docs that are not a bit set are not materialized: the lazy view answers
+          assertNull(sparseValues.materializeAcceptOrds(plainAcceptDocs));
+          Bits plainLazy = sparseValues.getAcceptOrds(plainAcceptDocs);
+          for (int ord = 0; ord < sparseValues.size(); ord++) {
+            assertEquals("ord=" + ord, lazy.get(ord), plainLazy.get(ord));
+          }
         }
-        assertNull(sparseValues.getAcceptOrds(null, DocIdSetIterator.all(numDocs)));
+        assertNull(sparseValues.materializeAcceptOrds(null));
 
         // A dense field has nothing to materialize: its ordinals are its docs
         FloatVectorValues denseValues =
             denseReader.leaves().get(0).reader().getFloatVectorValues("field");
         FixedBitSet acceptDocs = new FixedBitSet(denseValues.size());
         acceptDocs.set(0, denseValues.size());
-        assertSame(
-            acceptDocs,
-            denseValues.getAcceptOrds(
-                acceptDocs, new BitSetIterator(acceptDocs, acceptDocs.cardinality())));
+        assertSame(acceptDocs, denseValues.materializeAcceptOrds(acceptDocs));
+        Bits plainAcceptDocs =
+            new Bits() {
+              @Override
+              public boolean get(int index) {
+                return acceptDocs.get(index);
+              }
+
+              @Override
+              public int length() {
+                return acceptDocs.length();
+              }
+            };
+        assertNull(denseValues.materializeAcceptOrds(plainAcceptDocs));
+        assertSame(plainAcceptDocs, denseValues.getAcceptOrds(plainAcceptDocs));
       }
     }
   }

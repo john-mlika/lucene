@@ -23,6 +23,8 @@ import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.util.BitSet;
+import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 
@@ -31,10 +33,10 @@ import org.apache.lucene.util.hnsw.RandomVectorScorer;
  * approximate. This is what a format without a graph does, and what a format with one does when the
  * filter accepts few enough vectors that scoring all of them is the cheaper of the two.
  *
- * <p>Only the accepted ordinals are scored when {@link KnnVectorValues#acceptedOrdsIterator(Bits,
- * DocIdSetIterator)} can enumerate them, which every format that ships with Lucene can. When they
- * cannot be enumerated, every ordinal is tested against the accepted ordinals instead, which is
- * also what a search that accepts every doc does.
+ * <p>Only the accepted ordinals are scored when {@link KnnVectorValues#materializeAcceptOrds(Bits)}
+ * can materialize them, which every format that ships with Lucene can for the accept docs that
+ * {@link AcceptDocs} builds. When they cannot be materialized, every ordinal is tested against the
+ * accepted ordinals instead, which is also what a search that accepts every doc does.
  *
  * @lucene.experimental
  */
@@ -59,37 +61,30 @@ public final class ExhaustiveVectorSearcher {
       RandomVectorScorer scorer, KnnCollector knnCollector, AcceptDocs acceptDocs)
       throws IOException {
     Bits accepted = acceptDocs.bits();
-    Bits acceptedOrds = scorer.getAcceptOrds(accepted);
-    DocIdSetIterator acceptedOrdsIterator =
-        accepted == null ? null : scorer.acceptedOrdsIterator(accepted, acceptDocs.iterator());
-    search(scorer, knnCollector, acceptedOrds, acceptedOrdsIterator);
+    BitSet materialized = accepted == null ? null : scorer.materializeAcceptOrds(accepted);
+    search(
+        scorer, knnCollector, materialized != null ? materialized : scorer.getAcceptOrds(accepted));
   }
 
   /**
    * Scores the accepted vectors, for a caller that has already asked the scorer for the accepted
-   * ordinals and for an iterator over them.
+   * ordinals: exactly the accepted ordinals when they are a {@link BitSet}, every ordinal tested
+   * against them otherwise.
    *
    * @param scorer the scorer to compare the query with the vectors
    * @param knnCollector the collector of the top hits, which also carries the visit limit
    * @param acceptedOrds the accepted ordinals, or {@code null} if all vectors are accepted
-   * @param acceptedOrdsIterator an iterator over the ordinals that {@code acceptedOrds} accepts, or
-   *     {@code null} if they cannot be enumerated and have to be tested one at a time
    */
-  public static void search(
-      RandomVectorScorer scorer,
-      KnnCollector knnCollector,
-      Bits acceptedOrds,
-      DocIdSetIterator acceptedOrdsIterator)
+  public static void search(RandomVectorScorer scorer, KnnCollector knnCollector, Bits acceptedOrds)
       throws IOException {
     int[] ords = new int[BULK_SCORE_ORDS];
     float[] scores = new float[BULK_SCORE_ORDS];
     int numOrds = 0;
-    if (acceptedOrdsIterator != null) {
-      for (int ord = acceptedOrdsIterator.nextDoc();
-          ord != NO_MORE_DOCS;
-          ord = acceptedOrdsIterator.nextDoc()) {
-        assert acceptedOrds == null || acceptedOrds.get(ord)
-            : "ordinal " + ord + " is enumerated as accepted but tests as rejected";
+    if (acceptedOrds instanceof BitSet bitSet) {
+      assert bitSet.length() == scorer.maxOrd()
+          : "accepted ordinals of " + bitSet.length() + " bits for " + scorer.maxOrd() + " vectors";
+      DocIdSetIterator it = new BitSetIterator(bitSet, bitSet.approximateCardinality());
+      for (int ord = it.nextDoc(); ord != NO_MORE_DOCS; ord = it.nextDoc()) {
         if (knnCollector.earlyTerminated()) {
           break;
         }

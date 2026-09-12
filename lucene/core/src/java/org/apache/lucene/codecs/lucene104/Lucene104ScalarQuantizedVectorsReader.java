@@ -48,7 +48,6 @@ import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
@@ -58,6 +57,7 @@ import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
@@ -687,15 +687,8 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
     }
 
     @Override
-    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-        throws IOException {
-      return rawVectorValues.getAcceptOrds(acceptDocs, acceptDocsIterator);
-    }
-
-    @Override
-    public DocIdSetIterator acceptedOrdsIterator(
-        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
-      return rawVectorValues.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      return rawVectorValues.materializeAcceptOrds(acceptDocs);
     }
 
     @Override
@@ -761,15 +754,8 @@ public class Lucene104ScalarQuantizedVectorsReader extends FlatVectorsReader
     }
 
     @Override
-    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-        throws IOException {
-      return rawVectorValues.getAcceptOrds(acceptDocs, acceptDocsIterator);
-    }
-
-    @Override
-    public DocIdSetIterator acceptedOrdsIterator(
-        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
-      return rawVectorValues.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      return rawVectorValues.materializeAcceptOrds(acceptDocs);
     }
 
     @Override

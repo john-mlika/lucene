@@ -43,7 +43,6 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.AcceptDocs;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataAccessHint;
@@ -54,6 +53,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.PreloadHint;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.GroupVIntUtil;
 import org.apache.lucene.util.IOSupplier;
@@ -378,21 +378,22 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
             knnCollector, acceptedOrds, filteredDocCount, graphSize, fieldEntry.M())
         && shouldMaterializeAcceptOrds(
             filteredDocCount, graphSize, unfilteredVisit, accepted.length())) {
-      // The same bits, only answered in constant time. Accept docs that are backed by live docs
-      // alone hand out an iterator over every doc of the segment, but their cost is the whole
-      // segment too, so filteredDocCount is then graphSize and this branch is not taken.
-      acceptedOrds = scorer.getAcceptOrds(accepted, acceptDocs.iterator());
-      assert acceptedOrds != null;
+      // The same bits, only answered in constant time, when the values can materialize them
+      BitSet materialized = scorer.materializeAcceptOrds(accepted);
+      if (materialized != null) {
+        acceptedOrds = materialized;
+      }
     }
     if (doHnsw) {
       HnswGraphSearcher.search(
           scorer, collector, getGraph(fieldEntry), acceptedOrds, filteredDocCount);
     } else {
       // if k is larger than the number of vectors we expect to visit in an HNSW search,
-      // we can just score all the accepted vectors and collect them.
-      DocIdSetIterator acceptedOrdsIterator =
-          accepted == null ? null : scorer.acceptedOrdsIterator(accepted, acceptDocs.iterator());
-      ExhaustiveVectorSearcher.search(scorer, knnCollector, acceptedOrds, acceptedOrdsIterator);
+      // we can just score all the accepted vectors and collect them: exactly the accepted ordinals
+      // when the values can materialize them, every ordinal tested against them otherwise
+      BitSet materialized = accepted == null ? null : scorer.materializeAcceptOrds(accepted);
+      ExhaustiveVectorSearcher.search(
+          scorer, knnCollector, materialized != null ? materialized : acceptedOrds);
     }
   }
 

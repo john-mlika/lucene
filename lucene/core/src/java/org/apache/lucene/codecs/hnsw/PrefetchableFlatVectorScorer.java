@@ -20,7 +20,7 @@ package org.apache.lucene.codecs.hnsw;
 import java.io.IOException;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
-import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
@@ -187,15 +187,8 @@ public class PrefetchableFlatVectorScorer implements FlatVectorsScorer {
     }
 
     @Override
-    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-        throws IOException {
-      return delegate.getAcceptOrds(acceptDocs, acceptDocsIterator);
-    }
-
-    @Override
-    public DocIdSetIterator acceptedOrdsIterator(
-        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
-      return delegate.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      return delegate.materializeAcceptOrds(acceptDocs);
     }
 
     @Override
@@ -270,15 +263,8 @@ public class PrefetchableFlatVectorScorer implements FlatVectorsScorer {
     }
 
     @Override
-    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-        throws IOException {
-      return delegate.getAcceptOrds(acceptDocs, acceptDocsIterator);
-    }
-
-    @Override
-    public DocIdSetIterator acceptedOrdsIterator(
-        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) throws IOException {
-      return delegate.acceptedOrdsIterator(acceptDocs, acceptDocsIterator);
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      return delegate.materializeAcceptOrds(acceptDocs);
     }
 
     @Override

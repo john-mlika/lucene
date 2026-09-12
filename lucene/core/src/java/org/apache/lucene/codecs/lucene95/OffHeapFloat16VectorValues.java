@@ -27,8 +27,8 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.packed.DirectMonotonicReader;
 
@@ -158,11 +158,11 @@ public abstract class OffHeapFloat16VectorValues extends Float16VectorValues
     }
 
     @Override
-    public DocIdSetIterator acceptedOrdsIterator(
-        Bits acceptDocs, DocIdSetIterator acceptDocsIterator) {
-      // The ordinals are the docs, so the accepted docs are the accepted ordinals
+    public BitSet materializeAcceptOrds(Bits acceptDocs) {
+      // The ordinals are the docs, so the accepted docs are the accepted ordinals when they are a
+      // bit set; any other bits are answered lazily, which is the identity too
       assert size() == 0 || ordToDoc(size() - 1) == size() - 1;
-      return acceptDocs == null ? null : acceptDocsIterator;
+      return acceptDocs instanceof BitSet bitSet ? bitSet : null;
     }
 
     @Override
@@ -264,21 +264,10 @@ public abstract class OffHeapFloat16VectorValues extends Float16VectorValues
     }
 
     @Override
-    public Bits getAcceptOrds(Bits acceptDocs, DocIdSetIterator acceptDocsIterator)
-        throws IOException {
-      if (acceptDocs == null) {
-        return null;
-      }
-      // A word at a time over the blocks of the docs that have a vector, when acceptDocs is a
-      // bit set whose words can be walked
-      FixedBitSet acceptOrds = configuration.getAcceptOrds(dataIn, acceptDocs);
-      if (acceptOrds != null) {
-        return acceptOrds;
-      }
-      // Leap frog over a private view of the docs that have a vector, so that the iterator that
-      // this instance hands out is left where it is.
-      return materializeAcceptOrds(
-          acceptDocsIterator, IndexedDISI.asDocIndexIterator(configuration.getIndexedDISI(dataIn)));
+    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+      // A word at a time over the blocks of the docs that have a vector, when acceptDocs is a bit
+      // set whose words can be walked; any other bits cannot be materialized
+      return configuration.materializeAcceptOrds(dataIn, acceptDocs);
     }
 
     @Override
