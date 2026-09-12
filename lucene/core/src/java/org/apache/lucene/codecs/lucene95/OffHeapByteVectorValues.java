@@ -175,9 +175,9 @@ public abstract class OffHeapByteVectorValues extends ByteVectorValues implement
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) {
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) {
       // The ordinals are the docs, so the accepted docs are the accepted ordinals when they are a
-      // bit set; any other bits are answered lazily, which is the identity too
+      // bit set, at no cost whatever tests is; any other bits are answered lazily, the identity too
       assert size() == 0 || ordToDoc(size() - 1) == size() - 1;
       return acceptDocs instanceof BitSet bitSet ? bitSet : null;
     }
@@ -287,10 +287,10 @@ public abstract class OffHeapByteVectorValues extends ByteVectorValues implement
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
       // A word at a time over the blocks of the docs that have a vector, when acceptDocs is a bit
-      // set whose words can be walked; any other bits cannot be materialized
-      return configuration.materializeAcceptOrds(dataIn, acceptDocs);
+      // set whose words can be walked and the walk is expected to pay for the tests it saves
+      return configuration.materializeAcceptOrds(dataIn, acceptDocs, tests);
     }
 
     @Override

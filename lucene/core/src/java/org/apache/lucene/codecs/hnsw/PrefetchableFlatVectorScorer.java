@@ -187,8 +187,8 @@ public class PrefetchableFlatVectorScorer implements FlatVectorsScorer {
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
-      return delegate.materializeAcceptOrds(acceptDocs);
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return delegate.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override
@@ -263,8 +263,8 @@ public class PrefetchableFlatVectorScorer implements FlatVectorsScorer {
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
-      return delegate.materializeAcceptOrds(acceptDocs);
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return delegate.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override

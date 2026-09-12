@@ -127,6 +127,7 @@ public class HnswGraphSearcher extends AbstractHnswGraphSearcher {
       int filteredDocCount,
       int graphSize,
       int maxConn) {
+    assert filteredDocCount <= graphSize : filteredDocCount + " > " + graphSize;
     return acceptOrds != null
         // We can only use filtered search if we know the maxConn
         && maxConn != HnswGraph.UNKNOWN_MAX_CONN

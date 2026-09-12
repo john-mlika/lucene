@@ -67,8 +67,8 @@ public interface UpdateableRandomVectorScorer extends RandomVectorScorer {
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
-      return values.materializeAcceptOrds(acceptDocs);
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return values.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override

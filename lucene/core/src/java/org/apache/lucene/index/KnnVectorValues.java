@@ -75,10 +75,7 @@ public abstract class KnnVectorValues {
   /**
    * Returns a Bits accepting docs accepted by the argument and having a vector value.
    *
-   * <p>The bits are indexed by ordinal rather than by doc. An implementation that returns {@code
-   * acceptDocs} itself is asserting that its ordinals are its docs, which is the invariant that
-   * {@link #ordToDoc(int)} returns the argument, and that dense values rely on in {@link
-   * #materializeAcceptOrds(Bits)}.
+   * <p>The bits are indexed by ordinal rather than by doc.
    */
   public Bits getAcceptOrds(Bits acceptDocs) {
     // FIXME: change default to return acceptDocs and provide this impl
@@ -101,27 +98,32 @@ public abstract class KnnVectorValues {
 
   /**
    * Returns the accepted ordinals of {@link #getAcceptOrds(Bits)} materialized into a bit set, or
-   * {@code null} when they cannot be materialized and a caller has to test them one at a time
-   * through the lazy view instead.
+   * {@code null} when they cannot be materialized, or when materializing them is not expected to
+   * pay for itself, and a caller has to test them one at a time through the lazy view instead.
    *
    * <p>A bit set answers the same question as the lazy view in constant time, and it can be
    * enumerated, so a caller that would rather score exactly the accepted vectors than test every
-   * ordinal can do so. Materializing costs a pass over the accepted docs; whether that pass is
-   * worth the tests it saves is the caller's decision, this method only answers.
+   * ordinal can do so. Materializing costs a pass over the accepted docs, and only the values know
+   * what that pass costs, so the caller says how many ordinals it expects to test if they are not
+   * materialized, {@code tests}, and the values answer with a bit set only when their pass is
+   * expected to cost less than that many lookups.
    *
    * <p>The default implementation returns {@code null}. Values whose ordinals are their docs return
-   * {@code acceptDocs} itself when it is a {@link BitSet}, since the accepted docs are then the
-   * accepted ordinals. Values that map ordinals to docs through an off-heap structure answer with
-   * the ordinals of the accepted docs, computed a word at a time when {@code acceptDocs} is a
-   * {@link org.apache.lucene.util.FixedBitSet} or a {@link
-   * org.apache.lucene.util.SparseFixedBitSet}, which is what {@link
-   * org.apache.lucene.search.AcceptDocs} builds.
+   * {@code acceptDocs} itself when it is a {@link BitSet}, whatever {@code tests} is, since the
+   * accepted docs are then the accepted ordinals and there is nothing to walk. Values that map
+   * ordinals to docs through an off-heap structure answer with the ordinals of the accepted docs,
+   * computed a word at a time when {@code acceptDocs} is a {@link
+   * org.apache.lucene.util.FixedBitSet} or a {@link org.apache.lucene.util.SparseFixedBitSet},
+   * which is what a filtered {@link org.apache.lucene.search.AcceptDocs} builds; live docs alone
+   * are neither and are not materialized.
    *
    * @param acceptDocs the accepted docs, or {@code null} if all docs are accepted, in which case
    *     there is nothing to materialize
-   * @return the accepted ordinals as a bit set of {@link #size()} bits, or {@code null}
+   * @param tests how many ordinals the caller expects to test against {@link #getAcceptOrds(Bits)}
+   *     if they are not materialized
+   * @return the accepted ordinals as a bit set of at most {@link #size()} bits, or {@code null}
    */
-  public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+  public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
     return null;
   }
 

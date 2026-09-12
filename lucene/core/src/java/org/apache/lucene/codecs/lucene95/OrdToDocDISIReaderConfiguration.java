@@ -24,7 +24,6 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.RandomAccessInput;
-import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.SparseFixedBitSet;
@@ -204,24 +203,82 @@ public class OrdToDocDISIReaderConfiguration {
   }
 
   /**
+   * How many word operations of a materialization one ordinal to doc lookup of the lazy accepted
+   * ordinals costs. A lookup reads the off-heap ordinal to doc mapping through a {@code
+   * DirectMonotonicReader}, which is two on-heap array reads, a bounds-checked read of the packed
+   * off-heap values and a multiply-add, and then reads the accepted docs: about thirty instructions
+   * with three dependent loads. A word of the materialization is two loads, an AND, a POPCNT and an
+   * ADD, plus a PEXT and two shifted ORs when the word holds an accepted doc, and consecutive words
+   * are independent: about four instructions with no dependent load. That puts a lookup at about
+   * eight words.
+   *
+   * <p>This is an instruction count rather than a fitted value. It assumes that the JIT compiles
+   * {@code Long#compress} to PEXT, which it does on x86 with BMI2. Where it does not, a word that
+   * holds an accepted doc costs about as much as a lookup, and materializing pays off later than
+   * this value says.
+   */
+  static final int WORD_OPS_PER_LOOKUP = 8;
+
+  /**
+   * The words of one DENSE block of an {@link IndexedDISI}, which is also what an ALL block costs.
+   */
+  private static final int WORDS_PER_BLOCK = 1 << 10;
+
+  /**
+   * Whether materializing the accepted ordinals is expected to cost less than {@code tests} lookups
+   * through the lazy accepted ordinals, which is what it saves.
+   *
+   * <p>A materialization walks the blocks of the docs that have a vector, see {@link
+   * IndexedDISI#indicesOf}: a DENSE or an ALL block costs {@code WORDS_PER_BLOCK} words, a SPARSE
+   * block one short per doc, and a block is SPARSE when it holds fewer than a sixteenth of its
+   * docs, so a block costs about the smaller of {@code WORDS_PER_BLOCK} and the docs it holds,
+   * taken as the average over the blocks. Every block may hold an accepted doc, so all of them are
+   * charged, plus the bit set of {@code size} bits to zero for the result. Both sides are counted
+   * in word operations. The cost does not depend on how many docs the filter accepts, so it is the
+   * same for any filter over a given field, and the decision is about the tests alone.
+   *
+   * @param blocks the number of blocks of the docs that have a vector
+   * @param size the number of docs that have a vector
+   * @param tests the number of ordinals the caller expects to test if they are not materialized
+   */
+  public static boolean shouldMaterializeAcceptOrds(int blocks, int size, long tests) {
+    assert blocks > 0 && size >= 0 && tests >= 0;
+    long wordsPerBlock = Math.min(WORDS_PER_BLOCK, ((long) size + blocks - 1) / blocks);
+    long words = blocks * wordsPerBlock + size / Long.SIZE;
+    // tests * WORD_OPS_PER_LOOKUP >= words, without overflowing for a caller that tests everything
+    return tests >= (words + WORD_OPS_PER_LOOKUP - 1) / WORD_OPS_PER_LOOKUP;
+  }
+
+  /**
    * Returns the ordinals of the vectors whose doc is set in {@code acceptDocs}, computed a word at
    * a time over the blocks of the docs that have a vector rather than a doc at a time, see {@link
    * IndexedDISI#indicesOf}, or {@code null} if {@code acceptDocs} is not a bit set that can be
    * walked that way, which is any {@link Bits} other than a {@link FixedBitSet} or a {@link
-   * SparseFixedBitSet}.
+   * SparseFixedBitSet}, or if walking it is not expected to pay for {@code tests} lookups, see
+   * {@link #shouldMaterializeAcceptOrds}. Only valid for the sparse configuration, the one that has
+   * an {@link IndexedDISI}.
    *
    * @param dataIn the dataIn
    * @param acceptDocs the accepted docs
+   * @param tests how many ordinals the caller expects to test if they are not materialized
    * @return a bit set of {@code size} bits over the ordinals, or {@code null}
    * @throws IOException thrown when reading data fails
    */
-  public FixedBitSet materializeAcceptOrds(IndexInput dataIn, Bits acceptDocs) throws IOException {
-    if (acceptDocs instanceof FixedBitSet || acceptDocs instanceof SparseFixedBitSet) {
-      FixedBitSet acceptOrds = new FixedBitSet(size);
-      getIndexedDISI(dataIn).indicesOf((BitSet) acceptDocs, acceptOrds);
-      return acceptOrds;
+  public FixedBitSet materializeAcceptOrds(IndexInput dataIn, Bits acceptDocs, long tests)
+      throws IOException {
+    if ((acceptDocs instanceof FixedBitSet || acceptDocs instanceof SparseFixedBitSet) == false) {
+      return null;
     }
-    return null;
+    if (shouldMaterializeAcceptOrds(Math.max(1, jumpTableEntryCount), size, tests) == false) {
+      return null;
+    }
+    FixedBitSet acceptOrds = new FixedBitSet(size);
+    if (acceptDocs instanceof FixedBitSet fixedBitSet) {
+      getIndexedDISI(dataIn).indicesOf(fixedBitSet, acceptOrds);
+    } else {
+      getIndexedDISI(dataIn).indicesOf((SparseFixedBitSet) acceptDocs, acceptOrds);
+    }
+    return acceptOrds;
   }
 
   /**

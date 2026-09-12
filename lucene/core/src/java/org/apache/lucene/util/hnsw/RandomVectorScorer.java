@@ -81,13 +81,15 @@ public interface RandomVectorScorer {
 
   /**
    * Returns the accepted ordinals materialized into a bit set, or {@code null} when the values this
-   * scorer reads from cannot do it, see {@link KnnVectorValues#materializeAcceptOrds(Bits)}. By
-   * default they cannot, since only the values know how their ordinals map to their docs.
+   * scorer reads from cannot do it or do not expect it to pay for {@code tests} lookups, see {@link
+   * KnnVectorValues#materializeAcceptOrds(Bits, long)}. By default they cannot, since only the
+   * values know how their ordinals map to their docs.
    *
    * @param acceptDocs the accept docs
+   * @param tests how many ordinals the caller expects to test if they are not materialized
    * @return the accepted ordinals as a bit set, or {@code null}
    */
-  default BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
+  default BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
     return null;
   }
 
@@ -120,8 +122,8 @@ public interface RandomVectorScorer {
     }
 
     @Override
-    public BitSet materializeAcceptOrds(Bits acceptDocs) throws IOException {
-      return values.materializeAcceptOrds(acceptDocs);
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return values.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override

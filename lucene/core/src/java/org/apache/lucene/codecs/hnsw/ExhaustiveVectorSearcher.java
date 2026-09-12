@@ -33,10 +33,11 @@ import org.apache.lucene.util.hnsw.RandomVectorScorer;
  * approximate. This is what a format without a graph does, and what a format with one does when the
  * filter accepts few enough vectors that scoring all of them is the cheaper of the two.
  *
- * <p>Only the accepted ordinals are scored when {@link KnnVectorValues#materializeAcceptOrds(Bits)}
- * can materialize them, which every format that ships with Lucene can for the accept docs that
- * {@link AcceptDocs} builds. When they cannot be materialized, every ordinal is tested against the
- * accepted ordinals instead, which is also what a search that accepts every doc does.
+ * <p>Only the accepted ordinals are scored when {@link KnnVectorValues#materializeAcceptOrds(Bits,
+ * long)} materializes them, which every format that ships with Lucene does for the bit sets that a
+ * filtered {@link AcceptDocs} builds, as long as walking them costs less than testing every
+ * ordinal. Otherwise every ordinal is tested against the accepted ordinals, which is also what a
+ * search that accepts every doc, or only the live ones, does.
  *
  * @lucene.experimental
  */
@@ -61,29 +62,48 @@ public final class ExhaustiveVectorSearcher {
       RandomVectorScorer scorer, KnnCollector knnCollector, AcceptDocs acceptDocs)
       throws IOException {
     Bits accepted = acceptDocs.bits();
-    BitSet materialized = accepted == null ? null : scorer.materializeAcceptOrds(accepted);
+    // Without a materialization the scan tests every ordinal
+    BitSet materialized =
+        accepted == null ? null : scorer.materializeAcceptOrds(accepted, scorer.maxOrd());
     search(
-        scorer, knnCollector, materialized != null ? materialized : scorer.getAcceptOrds(accepted));
+        scorer,
+        knnCollector,
+        materialized != null ? materialized : scorer.getAcceptOrds(accepted),
+        materialized);
   }
 
   /**
    * Scores the accepted vectors, for a caller that has already asked the scorer for the accepted
-   * ordinals: exactly the accepted ordinals when they are a {@link BitSet}, every ordinal tested
-   * against them otherwise.
+   * ordinals: exactly the ordinals of {@code materializedAcceptOrds} when there is one, every
+   * ordinal tested against {@code acceptedOrds} otherwise.
    *
    * @param scorer the scorer to compare the query with the vectors
    * @param knnCollector the collector of the top hits, which also carries the visit limit
    * @param acceptedOrds the accepted ordinals, or {@code null} if all vectors are accepted
+   * @param materializedAcceptOrds the accepted ordinals as a bit set to enumerate, or {@code null}
+   *     if they were not materialized
    */
-  public static void search(RandomVectorScorer scorer, KnnCollector knnCollector, Bits acceptedOrds)
+  public static void search(
+      RandomVectorScorer scorer,
+      KnnCollector knnCollector,
+      Bits acceptedOrds,
+      BitSet materializedAcceptOrds)
       throws IOException {
     int[] ords = new int[BULK_SCORE_ORDS];
     float[] scores = new float[BULK_SCORE_ORDS];
     int numOrds = 0;
-    if (acceptedOrds instanceof BitSet bitSet) {
-      assert bitSet.length() == scorer.maxOrd()
-          : "accepted ordinals of " + bitSet.length() + " bits for " + scorer.maxOrd() + " vectors";
-      DocIdSetIterator it = new BitSetIterator(bitSet, bitSet.approximateCardinality());
+    if (materializedAcceptOrds != null) {
+      // Dense values hand back the accepted docs themselves, which may be a shorter bit set than
+      // the ordinals; never a longer one, that would feed ordinals past the last vector
+      assert materializedAcceptOrds.length() <= scorer.maxOrd()
+          : "accepted ordinals of "
+              + materializedAcceptOrds.length()
+              + " bits for "
+              + scorer.maxOrd()
+              + " vectors";
+      DocIdSetIterator it =
+          new BitSetIterator(
+              materializedAcceptOrds, materializedAcceptOrds.approximateCardinality());
       for (int ord = it.nextDoc(); ord != NO_MORE_DOCS; ord = it.nextDoc()) {
         if (knnCollector.earlyTerminated()) {
           break;
