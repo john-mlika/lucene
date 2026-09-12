@@ -262,12 +262,11 @@ public class TestLucene99HnswVectorsFormat extends BaseKnnVectorsFormatTestCase 
           "accepted=" + accepted,
           OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(4, numVectors, tests));
     }
-    // The plain searcher and the exhaustive scan on the same segment: the scan tests every ordinal
-    assertTrue(
-        OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(
-            4, numVectors, unfilteredVisit));
+    // The exhaustive scan on the same segment tests every ordinal; a search that asks for nothing
+    // gets nothing
     assertTrue(
         OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(4, numVectors, numVectors));
+    assertFalse(OrdToDocDISIReaderConfiguration.shouldMaterializeAcceptOrds(4, numVectors, 0));
     // A 10M doc segment with 9M vectors, 153 blocks of 1,024 words: a filter that accepts half of
     // the docs does not materialize, since the searcher is expected to make a few thousand lookups
     // while a materialization walks a few hundred thousand words, and a filter that accepts 1% of

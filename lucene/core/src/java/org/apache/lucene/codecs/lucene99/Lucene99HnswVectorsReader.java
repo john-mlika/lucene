@@ -376,13 +376,13 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
     // How many ordinals the search is expected to test against the accepted ordinals, which is
     // what materializing them into a bit set saves: the values weigh that against their own cost of
     // a materialization and answer with a bit set only when it pays. The exhaustive scan tests
-    // every
-    // ordinal unless it can enumerate the accepted ones. A searcher optimized for filtering tests
-    // the accepted ordinals of every neighbor of the nodes it pops and only counts as visited the
-    // ones that pass, so it runs about unfilteredVisit * graphSize / filteredDocCount tests, the
-    // estimate that FilteredHnswGraphSearcher itself uses to size its visited bit set, capped by
-    // the
-    // graph size since it tests a node at most once. The plain searcher tests the nodes it scores.
+    // every ordinal unless it can enumerate the accepted ones. A searcher optimized for filtering
+    // tests the accepted ordinals of every neighbor of the nodes it pops and only counts as visited
+    // the ones that pass, so it runs about unfilteredVisit * graphSize / filteredDocCount tests,
+    // the estimate that FilteredHnswGraphSearcher itself uses to size its visited bit set, capped
+    // by the graph size since it tests a node at most once. The plain searcher only tests the
+    // nodes it scores that are competitive, too few for a materialization to pay for itself: it
+    // measured 2% slower at a 95% filter on x86 and on ARM, so nothing is asked for it.
     final long tests;
     if (doHnsw == false) {
       tests = numVectors;
@@ -390,7 +390,7 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
         knnCollector, acceptedOrds, filteredDocCount, graphSize, fieldEntry.M())) {
       tests = Math.min((long) unfilteredVisit * graphSize / filteredDocCount, graphSize);
     } else {
-      tests = unfilteredVisit;
+      tests = 0;
     }
     // Accept docs that are backed by live docs alone are not a bit set and are never materialized
     BitSet materialized = accepted == null ? null : scorer.materializeAcceptOrds(accepted, tests);
