@@ -29,6 +29,7 @@ import org.apache.lucene.sandbox.codecs.dedup.DedupVectorValues.FieldOrdToGroupO
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
@@ -180,6 +181,11 @@ final class DedupScalarQuantizedVectorValues {
     }
 
     @Override
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return fieldView.materializeAcceptOrds(acceptDocs, tests);
+    }
+
+    @Override
     public DocIndexIterator iterator() {
       return fieldView.iterator();
     }
@@ -296,6 +302,11 @@ final class DedupScalarQuantizedVectorValues {
     @Override
     public Bits getAcceptOrds(Bits acceptDocs) {
       return rawValues.getAcceptOrds(acceptDocs);
+    }
+
+    @Override
+    public BitSet materializeAcceptOrds(Bits acceptDocs, long tests) throws IOException {
+      return rawValues.materializeAcceptOrds(acceptDocs, tests);
     }
 
     @Override
