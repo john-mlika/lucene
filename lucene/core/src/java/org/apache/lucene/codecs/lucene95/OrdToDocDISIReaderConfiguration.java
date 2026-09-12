@@ -225,17 +225,24 @@ public class OrdToDocDISIReaderConfiguration {
   private static final int WORDS_PER_BLOCK = 1 << 10;
 
   /**
+   * A block of an {@link IndexedDISI} that holds fewer docs than this is SPARSE and costs one short
+   * per doc to walk rather than a word per 64 docs, see {@code IndexedDISI#MAX_ARRAY_LENGTH}.
+   */
+  private static final int SPARSE_BLOCK_MAX_DOCS = 1 << 12;
+
+  /**
    * Whether materializing the accepted ordinals is expected to cost less than {@code tests} lookups
    * through the lazy accepted ordinals, which is what it saves.
    *
    * <p>A materialization walks the blocks of the docs that have a vector, see {@link
    * IndexedDISI#indicesOf}: a DENSE or an ALL block costs {@code WORDS_PER_BLOCK} words, a SPARSE
-   * block one short per doc, and a block is SPARSE when it holds fewer than a sixteenth of its
-   * docs, so a block costs about the smaller of {@code WORDS_PER_BLOCK} and the docs it holds,
-   * taken as the average over the blocks. Every block may hold an accepted doc, so all of them are
-   * charged, plus the bit set of {@code size} bits to zero for the result. Both sides are counted
-   * in word operations. The cost does not depend on how many docs the filter accepts, so it is the
-   * same for any filter over a given field, and the decision is about the tests alone.
+   * block one short per doc, and a block is SPARSE when it holds fewer than {@code
+   * SPARSE_BLOCK_MAX_DOCS} docs, so a block costs its docs when it holds fewer than that and {@code
+   * WORDS_PER_BLOCK} words otherwise, taken as the average over the blocks: a nearly full SPARSE
+   * block costs about four times a DENSE one. Every block may hold an accepted doc, so all of them
+   * are charged, plus the bit set of {@code size} bits to zero for the result. Both sides are
+   * counted in word operations. The cost does not depend on how many docs the filter accepts, so it
+   * is the same for any filter over a given field, and the decision is about the tests alone.
    *
    * @param blocks the number of blocks of the docs that have a vector
    * @param size the number of docs that have a vector
@@ -243,7 +250,8 @@ public class OrdToDocDISIReaderConfiguration {
    */
   public static boolean shouldMaterializeAcceptOrds(int blocks, int size, long tests) {
     assert blocks > 0 && size >= 0 && tests >= 0;
-    long wordsPerBlock = Math.min(WORDS_PER_BLOCK, ((long) size + blocks - 1) / blocks);
+    long docsPerBlock = ((long) size + blocks - 1) / blocks;
+    long wordsPerBlock = docsPerBlock < SPARSE_BLOCK_MAX_DOCS ? docsPerBlock : WORDS_PER_BLOCK;
     long words = blocks * wordsPerBlock + size / Long.SIZE;
     // tests * WORD_OPS_PER_LOOKUP >= words, without overflowing for a caller that tests everything
     return tests >= (words + WORD_OPS_PER_LOOKUP - 1) / WORD_OPS_PER_LOOKUP;
