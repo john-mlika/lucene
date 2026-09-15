@@ -152,10 +152,6 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
     flatVectorsReader.finishMerge();
   }
 
-  public FlatVectorsReader getFlatVectorsReader() {
-    return flatVectorsReader;
-  }
-
   private static IndexInput openDataInput(
       SegmentReadState state,
       int versionMeta,
