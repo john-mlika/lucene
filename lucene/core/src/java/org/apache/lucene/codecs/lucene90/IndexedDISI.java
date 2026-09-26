@@ -109,6 +109,8 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
   public static final byte DEFAULT_DENSE_RANK_POWER = 9; // Every 512 docIDs / 8 longs
 
   static final int MAX_ARRAY_LENGTH = (1 << 12) - 1;
+  // How many doc IDs of a SPARSE block are read at once when loading them into a bit set
+  static final int SPARSE_CHUNK_SIZE = 64;
 
   private static void flush(
       int block, FixedBitSet buffer, int cardinality, byte denseRankPower, IndexOutput out)
@@ -408,6 +410,7 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
   // SPARSE variables
   boolean exists;
   int nextExistDocInBlock = -1;
+  short[] docsInBlock;
 
   // DENSE variables
   long word;
@@ -636,17 +639,29 @@ public final class IndexedDISI extends AbstractDocIdSetIterator {
       boolean intoBitSetWithinBlock(IndexedDISI disi, int upTo, FixedBitSet bitSet, int offset)
           throws IOException {
         bitSet.set(disi.doc - offset);
-        for (; disi.index < disi.nextBlockIndex; ) {
-          int docInBlock = disi.slice.readShort() & 0xFFFF;
-          int doc = disi.block | docInBlock;
-          disi.index++;
-          if (doc >= upTo) {
-            disi.doc = doc;
-            disi.exists = true;
-            disi.nextExistDocInBlock = docInBlock;
-            return true;
+        if (disi.docsInBlock == null) {
+          disi.docsInBlock = new short[SPARSE_CHUNK_SIZE];
+        }
+        final short[] docsInBlock = disi.docsInBlock;
+        // Read the doc IDs in bulk, like DENSE reads its words, rather than one readShort() each
+        while (disi.index < disi.nextBlockIndex) {
+          final int count = Math.min(docsInBlock.length, disi.nextBlockIndex - disi.index);
+          disi.slice.readShorts(docsInBlock, 0, count);
+          for (int i = 0; i < count; ++i) {
+            int docInBlock = Short.toUnsignedInt(docsInBlock[i]);
+            int doc = disi.block | docInBlock;
+            if (doc >= upTo) {
+              // Stop on this doc, and give back the doc IDs that were read after it
+              disi.index += i + 1;
+              disi.doc = doc;
+              disi.exists = true;
+              disi.nextExistDocInBlock = docInBlock;
+              disi.slice.seek(disi.slice.getFilePointer() - (long) (count - i - 1) * Short.BYTES);
+              return true;
+            }
+            bitSet.set(doc - offset);
           }
-          bitSet.set(doc - offset);
+          disi.index += count;
         }
         return false;
       }
