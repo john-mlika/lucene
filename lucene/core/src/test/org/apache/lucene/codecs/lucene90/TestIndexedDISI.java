@@ -493,6 +493,23 @@ public class TestIndexedDISI extends LuceneTestCase {
     }
   }
 
+  public void testSparseBlockIntoBitSetChunks() throws IOException {
+    // SPARSE blocks load their doc IDs into a bit set a chunk at a time: cover blocks around the
+    // chunk size and the largest SPARSE block, with windows that end inside a chunk
+    final int chunk = IndexedDISI.SPARSE_CHUNK_SIZE;
+    try (Directory dir = newDirectory()) {
+      for (int numDocs :
+          new int[] {1, chunk - 1, chunk, chunk + 1, 2 * chunk + 1, IndexedDISI.MAX_ARRAY_LENGTH}) {
+        FixedBitSet set = new FixedBitSet(2 * 65536 + 100);
+        for (int i = 0; i < numDocs; ++i) {
+          set.set(i * 7); // first block, SPARSE
+          set.set(65536 + i * 11); // second block, SPARSE with another stride
+        }
+        doTest(set, dir);
+      }
+    }
+  }
+
   @Nightly
   public void testRandom() throws IOException {
     try (Directory dir = newDirectory()) {
