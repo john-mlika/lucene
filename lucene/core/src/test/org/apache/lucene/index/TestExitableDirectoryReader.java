@@ -20,6 +20,7 @@ import static com.carrotsearch.randomizedtesting.RandomizedTest.atMost;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -41,7 +42,9 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.analysis.MockAnalyzer;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOFunction;
 import org.apache.lucene.util.SuppressForbidden;
 import org.apache.lucene.util.TestVectorUtil;
@@ -501,6 +504,90 @@ public class TestExitableDirectoryReader extends LuceneTestCase {
 
     reader.close();
     directory.close();
+  }
+
+  /**
+   * The wrapper around a vector field's iterator keeps the delegate's bulk load and its run ends,
+   * so that loading the docs that have a vector into a bit set does not fall back to one nextDoc
+   * per doc, and a timeout is still honoured before a load. Most docs have a vector, so their
+   * IndexedDISI block is DENSE and holds runs of consecutive docs.
+   */
+  public void testFloatVectorValuesIntoBitSetAndRunEnd() throws IOException {
+    try (Directory directory = newDirectory()) {
+      int numDocs = atLeast(5000);
+      double density = 0.9 + 0.09 * random().nextDouble();
+      try (IndexWriter writer = new IndexWriter(directory, newIndexWriterConfig())) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          if (random().nextDouble() < density) {
+            float[] vector = {random().nextFloat(), random().nextFloat()};
+            doc.add(new KnnFloatVectorField("vector", vector, VectorSimilarityFunction.EUCLIDEAN));
+          }
+          writer.addDocument(doc);
+        }
+        writer.forceMerge(1);
+      }
+      try (DirectoryReader directoryReader = DirectoryReader.open(directory)) {
+        LeafReader plain = getOnlyLeafReader(directoryReader);
+        FloatVectorValues plainValues = plain.getFloatVectorValues("vector");
+        int maxDoc = plain.maxDoc();
+        FixedBitSet expected = new FixedBitSet(maxDoc);
+        KnnVectorValues.DocIndexIterator it = plainValues.iterator();
+        for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+          expected.set(doc);
+        }
+
+        // One timeout check to position the iterator and one for the load, not one per 1000 docs
+        CountingQueryTimeout counting = new CountingQueryTimeout();
+        LeafReader counted =
+            getOnlyLeafReader(new ExitableDirectoryReader(directoryReader, counting));
+        FixedBitSet actual = new FixedBitSet(maxDoc);
+        actual.or(counted.getFloatVectorValues("vector").iterator());
+        assertEquals(expected, actual);
+        assertTrue(
+            "shouldExit calls: " + counting.getShouldExitCallCount(),
+            counting.getShouldExitCallCount() <= 2);
+
+        // Loads of random windows keep docID, index and run ends in step with the unwrapped
+        // iterator
+        LeafReader exitable =
+            getOnlyLeafReader(new ExitableDirectoryReader(directoryReader, infiniteQueryTimeout()));
+        KnnVectorValues.DocIndexIterator wrapped =
+            exitable.getFloatVectorValues("vector").iterator();
+        KnnVectorValues.DocIndexIterator reference =
+            plain.getFloatVectorValues("vector").iterator();
+        FixedBitSet windows = new FixedBitSet(maxDoc);
+        assertEquals(reference.nextDoc(), wrapped.nextDoc());
+        while (wrapped.docID() != DocIdSetIterator.NO_MORE_DOCS) {
+          assertEquals(reference.docIDRunEnd(), wrapped.docIDRunEnd());
+          int upTo = Math.min(maxDoc, wrapped.docID() + TestUtil.nextInt(random(), 1, 1000));
+          wrapped.intoBitSet(upTo, windows, 0);
+          assertEquals(reference.advance(upTo), wrapped.docID());
+          if (wrapped.docID() == DocIdSetIterator.NO_MORE_DOCS) {
+            break;
+          }
+          assertEquals(reference.index(), wrapped.index());
+          windows.set(wrapped.docID());
+          assertEquals(reference.nextDoc(), wrapped.nextDoc());
+          if (wrapped.docID() != DocIdSetIterator.NO_MORE_DOCS) {
+            assertEquals(reference.index(), wrapped.index());
+          }
+        }
+        assertEquals(expected, windows);
+
+        // A timeout that fires before a load stops it
+        AtomicBoolean exit = new AtomicBoolean();
+        LeafReader timed =
+            getOnlyLeafReader(new ExitableDirectoryReader(directoryReader, exit::get));
+        KnnVectorValues.DocIndexIterator timedIterator =
+            timed.getFloatVectorValues("vector").iterator();
+        timedIterator.nextDoc();
+        exit.set(true);
+        expectThrows(
+            ExitingReaderException.class,
+            () -> timedIterator.intoBitSet(maxDoc, new FixedBitSet(maxDoc), 0));
+      }
+    }
   }
 
   public void testByteVectorValues() throws IOException {
