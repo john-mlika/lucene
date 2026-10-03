@@ -439,8 +439,9 @@ Improvements
 Optimizations
 ---------------------
 * GITHUB#XXXXX: The KnnVectorValues.DocIndexIterator that IndexedDISI#asDocIndexIterator returns
-  delegates DocIdSetIterator#intoBitSet and #docIDRunEnd, so loading the doc IDs of a sparse vector
-  field into a bit set is a bulk operation again. (John Maurice)
+  delegates DocIdSetIterator#intoBitSet and #docIDRunEnd, and so does the iterator that
+  ExitableDirectoryReader wraps around it, so loading the doc IDs of a sparse vector field into a bit
+  set is a bulk operation again. (John Maurice)
 
 * GITHUB#XXXXX: AbstractKnnVectorQuery intersects the pre-filter with the docs that have a vector
   with bulk word-level operations rather than by walking a conjunction one doc at a time, and
