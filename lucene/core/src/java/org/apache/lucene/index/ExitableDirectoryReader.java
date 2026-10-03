@@ -27,6 +27,7 @@ import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
 
 /**
@@ -653,6 +654,19 @@ public class ExitableDirectoryReader extends FilterDirectoryReader {
           nextCheck = doc + ExitableFilterAtomicReader.DOCS_BETWEEN_TIMEOUT_CHECK;
         }
         return doc;
+      }
+
+      @Override
+      public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+        // Keep the delegate's bulk load rather than falling back to one nextDoc per doc, and check
+        // the timeout once per call
+        checkAndThrow();
+        delegate.intoBitSet(upTo, bitSet, offset);
+      }
+
+      @Override
+      public int docIDRunEnd() throws IOException {
+        return delegate.docIDRunEnd();
       }
 
       private void checkAndThrow() {
