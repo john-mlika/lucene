@@ -255,17 +255,8 @@ abstract class AbstractKnnVectorQuery extends Query {
     }
 
     AcceptDocs acceptDocs =
-        AcceptDocs.fromIteratorSupplier(
-            () -> {
-              Scorer scorer = filterWeight.scorer(ctx);
-              if (scorer == null) {
-                return DocIdSetIterator.empty();
-              } else {
-                return scorer.iterator();
-              }
-            },
-            liveDocs,
-            reader.maxDoc());
+        AcceptDocs.fromScorerSupplier(
+            () -> filterWeight.scorerSupplier(ctx), liveDocs, reader.maxDoc());
     final int cost = acceptDocs.cost();
     QueryTimeout queryTimeout = timeLimitingKnnCollectorManager.getQueryTimeout();
 

@@ -860,6 +860,72 @@ abstract class BaseKnnVectorQueryTestCase extends LuceneTestCase {
     }
   }
 
+  /**
+   * A dense conjunctive filter, whose accept docs are collected with the filter's bulk scorer when
+   * the searcher has no query cache, gives exactly the filter's live matches that have a vector,
+   * whether every document has a vector (the filter alone is collected) or not (the vector's
+   * presence is one more clause of the collected conjunction).
+   */
+  public void testDenseConjunctiveFilter() throws IOException {
+    doTestDenseConjunctiveFilter(false);
+    doTestDenseConjunctiveFilter(true);
+  }
+
+  private void doTestDenseConjunctiveFilter(boolean withVectorless) throws IOException {
+    int numDocs = TestUtil.nextInt(random(), DenseConjunctionBulkScorer.WINDOW_SIZE, 10_000);
+    int dim = TestUtil.nextInt(random(), 2, 8);
+    try (Directory d = newDirectoryForTest()) {
+      try (IndexWriter w = new IndexWriter(d, configStandardCodec())) {
+        for (int i = 0; i < numDocs; ++i) {
+          Document doc = new Document();
+          if (withVectorless == false || i % 7 != 0) {
+            doc.add(getKnnVectorField("field", randomVector(dim)));
+          }
+          doc.add(new StringField("id", Integer.toString(i), Field.Store.NO));
+          doc.add(new StringField("half", Integer.toString(i % 2), Field.Store.NO));
+          doc.add(new StringField("third", Integer.toString(i % 3), Field.Store.NO));
+          doc.add(new StringField("eighth", Integer.toString(i % 8), Field.Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+        int numDeletes = random().nextInt(numDocs / 10);
+        for (int i = 0; i < numDeletes; ++i) {
+          w.deleteDocuments(new Term("id", Integer.toString(random().nextInt(numDocs))));
+        }
+      }
+      try (IndexReader reader = DirectoryReader.open(d)) {
+        // no asserting wrappers, which would hide the boolean filter's scorer supplier
+        IndexSearcher searcher = newSearcher(reader, true, false);
+        searcher.setQueryCache(null);
+        Query filter =
+            new BooleanQuery.Builder()
+                .add(new TermQuery(new Term("half", "0")), BooleanClause.Occur.FILTER)
+                .add(new TermQuery(new Term("third", "1")), BooleanClause.Occur.FILTER)
+                .add(new TermQuery(new Term("eighth", "4")), BooleanClause.Occur.MUST_NOT)
+                .build();
+        Query filterWithVector =
+            new BooleanQuery.Builder()
+                .add(filter, BooleanClause.Occur.FILTER)
+                .add(new FieldExistsQuery("field"), BooleanClause.Occur.FILTER)
+                .build();
+        Set<Integer> expected = new HashSet<>();
+        for (ScoreDoc scoreDoc : searcher.search(filterWithVector, numDocs).scoreDocs) {
+          expected.add(scoreDoc.doc);
+        }
+        assertFalse(expected.isEmpty());
+
+        TopDocs results =
+            searcher.search(
+                getKnnVectorQuery("field", randomVector(dim), numDocs, filter), numDocs);
+        Set<Integer> actual = new HashSet<>();
+        for (ScoreDoc scoreDoc : results.scoreDocs) {
+          actual.add(scoreDoc.doc);
+        }
+        assertEquals(expected, actual);
+      }
+    }
+  }
+
   public void testAllDeletes() throws IOException {
     try (Directory dir = newDirectoryForTest();
         IndexWriter w = new IndexWriter(dir, newIndexWriterConfig())) {

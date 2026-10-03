@@ -68,6 +68,11 @@ final class BooleanScorerSupplier extends ScorerSupplier {
     this.maxDoc = maxDoc;
   }
 
+  /** Returns whether this supplier has required clauses, ie. whether it scores a conjunction. */
+  boolean hasRequiredClauses() {
+    return subs.get(Occur.MUST).size() + subs.get(Occur.FILTER).size() > 0;
+  }
+
   private long computeShouldCost() throws IOException {
     final Collection<ScorerSupplier> optionalScorers = subs.get(Occur.SHOULD);
     long[] costs = new long[optionalScorers.size()];

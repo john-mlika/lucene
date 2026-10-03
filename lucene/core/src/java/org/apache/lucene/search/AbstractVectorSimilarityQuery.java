@@ -207,17 +207,8 @@ abstract class AbstractVectorSimilarityQuery extends Query {
           return VectorSimilarityScorerSupplier.fromScoreDocs(boost, results.scoreDocs);
         } else {
           AcceptDocs acceptDocs =
-              AcceptDocs.fromIteratorSupplier(
-                  () -> {
-                    Scorer scorer = filterWeight.scorer(context);
-                    if (scorer == null) {
-                      return DocIdSetIterator.empty();
-                    } else {
-                      return scorer.iterator();
-                    }
-                  },
-                  liveDocs,
-                  leafReader.maxDoc());
+              AcceptDocs.fromScorerSupplier(
+                  () -> filterWeight.scorerSupplier(context), liveDocs, leafReader.maxDoc());
 
           int cardinality = acceptDocs.cost();
           if (cardinality == 0) {

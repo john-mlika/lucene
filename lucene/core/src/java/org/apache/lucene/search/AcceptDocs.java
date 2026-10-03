@@ -17,6 +17,8 @@
 
 package org.apache.lucene.search;
 
+import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+
 import java.io.IOException;
 import java.util.Objects;
 import org.apache.lucene.index.LeafReader;
@@ -88,6 +90,25 @@ public abstract class AcceptDocs {
   public static AcceptDocs fromIteratorSupplier(
       IOSupplier<DocIdSetIterator> iteratorSupplier, Bits liveDocs, int maxDoc) {
     return new DocIdSetIteratorAcceptDocs(iteratorSupplier, liveDocs, maxDoc);
+  }
+
+  /**
+   * Create AcceptDocs from an {@link IOSupplier} of the filter's {@link ScorerSupplier}, optionally
+   * filtered by live documents. The accepted documents are the same as with {@link
+   * #fromIteratorSupplier(IOSupplier, Bits, int)} over the supplier's iterator, but a dense
+   * conjunctive boolean filter is collected with its {@link BulkScorer}, the way {@link
+   * LRUQueryCache} collects a filter it caches, so that its clauses are intersected over windows of
+   * doc IDs with bit sets instead of one document at a time.
+   *
+   * @param scorerSupplier supplies the scorer supplier of the filter's weight, created with {@link
+   *     ScoreMode#COMPLETE_NO_SCORES}, which may be {@code null} if the filter matches no documents
+   * @param liveDocs Bits representing live documents, or {@code null} if no deleted docs.
+   * @param maxDoc the number of documents in the reader
+   * @return AcceptDocs over the filter's matches
+   */
+  public static AcceptDocs fromScorerSupplier(
+      IOSupplier<ScorerSupplier> scorerSupplier, Bits liveDocs, int maxDoc) {
+    return new ScorerSupplierAcceptDocs(scorerSupplier, liveDocs, maxDoc);
   }
 
   private static BitSet createBitSet(DocIdSetIterator iterator, Bits liveDocs, int maxDoc)
@@ -162,8 +183,8 @@ public abstract class AcceptDocs {
   private static class DocIdSetIteratorAcceptDocs extends AcceptDocs {
 
     private final IOSupplier<DocIdSetIterator> iteratorSupplier;
-    private final Bits liveDocs;
-    private final int maxDoc;
+    final Bits liveDocs;
+    final int maxDoc;
     private BitSet acceptBitSet;
     private int cardinality;
 
@@ -176,12 +197,16 @@ public abstract class AcceptDocs {
 
     private void createBitSetAcceptDocsIfNecessary() throws IOException {
       if (acceptBitSet == null) {
-        // Pass the raw iterator: #createBitSet applies liveDocs itself, and filtering upfront
-        // would hide DocIdSetIterator#intoBitSet behind a wrapper that has no bulk implementation.
-        DocIdSetIterator iterator = Objects.requireNonNull(iteratorSupplier.get());
-        acceptBitSet = Objects.requireNonNull(createBitSet(iterator, liveDocs, maxDoc));
+        acceptBitSet = Objects.requireNonNull(buildBitSet());
         cardinality = acceptBitSet.cardinality();
       }
+    }
+
+    BitSet buildBitSet() throws IOException {
+      // Pass the raw iterator: #createBitSet applies liveDocs itself, and filtering upfront
+      // would hide DocIdSetIterator#intoBitSet behind a wrapper that has no bulk implementation.
+      DocIdSetIterator iterator = Objects.requireNonNull(iteratorSupplier.get());
+      return createBitSet(iterator, liveDocs, maxDoc);
     }
 
     @Override
@@ -203,6 +228,81 @@ public abstract class AcceptDocs {
       }
       DocIdSetIterator iterator = Objects.requireNonNull(iteratorSupplier.get());
       return AcceptDocs.getFilteredDocIdSetIterator(iterator, liveDocs);
+    }
+  }
+
+  /**
+   * Impl backed by a {@link ScorerSupplier}: like {@link DocIdSetIteratorAcceptDocs} over the
+   * supplier's iterator, except that the bit set of a dense boolean filter is collected with the
+   * filter's {@link BulkScorer}.
+   */
+  private static class ScorerSupplierAcceptDocs extends DocIdSetIteratorAcceptDocs {
+
+    private final IOSupplier<ScorerSupplier> scorerSupplier;
+
+    ScorerSupplierAcceptDocs(IOSupplier<ScorerSupplier> scorerSupplier, Bits liveDocs, int maxDoc) {
+      super(() -> iterator(scorerSupplier.get()), liveDocs, maxDoc);
+      this.scorerSupplier = Objects.requireNonNull(scorerSupplier);
+    }
+
+    private static DocIdSetIterator iterator(ScorerSupplier supplier) throws IOException {
+      return supplier == null ? DocIdSetIterator.empty() : supplier.get(Long.MAX_VALUE).iterator();
+    }
+
+    @Override
+    BitSet buildBitSet() throws IOException {
+      ScorerSupplier supplier = scorerSupplier.get();
+      if (collectWithBulkScorer(supplier, maxDoc)) {
+        FixedBitSet bitSet = new FixedBitSet(maxDoc);
+        // The bulk scorer takes live docs as acceptDocs, so deleted documents are never collected.
+        supplier.bulkScorer().score(new BitSetCollector(bitSet), liveDocs, 0, NO_MORE_DOCS);
+        return bitSet;
+      }
+      return createBitSet(iterator(supplier), liveDocs, maxDoc);
+    }
+  }
+
+  /**
+   * Whether to collect the accept docs of a filter with its bulk scorer rather than its iterator: a
+   * conjunctive boolean filter whose leading clause matches at least one document in {@link
+   * DenseConjunctionBulkScorer#DENSITY_THRESHOLD_INVERSE}, the density from which {@link
+   * BooleanScorerSupplier} intersects clauses over windows of doc IDs with bit sets. Sparser
+   * filters keep their iterator, which only visits candidates, and so do filters without required
+   * clauses, whose iterator, for a plain disjunction, already loads its clauses in bulk, and other
+   * filters, including filters that the query cache serves as a bit set, which {@link
+   * #createBitSet} reuses or loads in bulk.
+   */
+  static boolean collectWithBulkScorer(ScorerSupplier supplier, int maxDoc) throws IOException {
+    return supplier instanceof BooleanScorerSupplier bss
+        && bss.hasRequiredClauses()
+        && maxDoc >= DenseConjunctionBulkScorer.WINDOW_SIZE
+        && bss.cost() >= maxDoc / DenseConjunctionBulkScorer.DENSITY_THRESHOLD_INVERSE;
+  }
+
+  /** Sets the bit of every collected document. */
+  private static final class BitSetCollector implements LeafCollector {
+    private final FixedBitSet bitSet;
+
+    BitSetCollector(FixedBitSet bitSet) {
+      this.bitSet = bitSet;
+    }
+
+    @Override
+    public void setScorer(Scorable scorer) {}
+
+    @Override
+    public void collect(int doc) {
+      bitSet.set(doc);
+    }
+
+    @Override
+    public void collect(DocIdStream stream) throws IOException {
+      stream.forEach(bitSet::set);
+    }
+
+    @Override
+    public void collectRange(int min, int max) {
+      bitSet.set(min, max);
     }
   }
 
